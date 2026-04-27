@@ -1050,19 +1050,27 @@ def _generate_moss_tts(text: str, output_path: str, tts_config: Dict[str, Any]) 
             seed=seed,
         )
 
+        if not os.path.exists(wav_path):
+            raise RuntimeError(f"MOSS synthesize completed but output file was not created: {wav_path}")
+
         if wav_path != output_path:
             ffmpeg = shutil.which("ffmpeg")
             if ffmpeg:
                 conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
                 subprocess.run(conv_cmd, check=True, timeout=30)
+                if not os.path.exists(output_path):
+                    raise RuntimeError(f"ffmpeg conversion failed: {output_path} was not created")
             else:
-                os.replace(wav_path, output_path)
+                shutil.move(wav_path, output_path)
     finally:
         if wav_path != output_path and os.path.exists(wav_path):
             try:
                 os.remove(wav_path)
             except OSError:
                 pass
+
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"TTS output file missing after generation: {output_path}")
 
     return output_path
 
