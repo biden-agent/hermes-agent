@@ -385,6 +385,7 @@ class FeishuAdapterSettings:
     ws_ping_interval: Optional[int] = None
     ws_ping_timeout: Optional[int] = None
     admins: frozenset[str] = frozenset()
+    require_mention: bool = True
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
 
@@ -1386,6 +1387,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Bot-level admins
         raw_admins = extra.get("admins", [])
         admins = frozenset(str(u).strip() for u in raw_admins if str(u).strip())
+        require_mention = os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower() != "false"
 
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
@@ -1444,6 +1446,7 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
             admins=admins,
+            require_mention=require_mention,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
         )
@@ -1458,6 +1461,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._group_policy = settings.group_policy
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
+        self._require_mention = settings.require_mention
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
         self._bot_open_id = settings.bot_open_id
@@ -2341,6 +2345,23 @@ class FeishuAdapter(BasePlatformAdapter):
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         user_name = self._get_cached_sender_name(open_id) or open_id
+
+        if self._admins and open_id not in self._admins:
+            if P2CardActionTriggerResponse is None:
+                return None
+            response = P2CardActionTriggerResponse()
+            if CallBackCard is not None:
+                card = CallBackCard()
+                card.type = "raw"
+                card.data = json.dumps(
+                    {
+                        "config": {"wide_screen_mode": True},
+                        "elements": [{"tag": "markdown", "content": "Only bot admins can approve this action."}],
+                    },
+                    ensure_ascii=False,
+                )
+                response.card = card
+            return response
 
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
@@ -3629,6 +3650,8 @@ class FeishuAdapter(BasePlatformAdapter):
         """Require an explicit @mention before group messages enter the agent."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
+        if not self._require_mention:
+            return True
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
