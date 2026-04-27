@@ -1056,7 +1056,16 @@ def _generate_moss_tts(text: str, output_path: str, tts_config: Dict[str, Any]) 
         if wav_path != output_path:
             ffmpeg = shutil.which("ffmpeg")
             if ffmpeg:
-                conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+                if output_path.lower().endswith(".ogg"):
+                    conv_cmd = [
+                        ffmpeg, "-i", wav_path,
+                        "-acodec", "libopus", "-ac", "1",
+                        "-b:a", "64k", "-vbr", "off",
+                        "-y", "-loglevel", "error",
+                        output_path,
+                    ]
+                else:
+                    conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
                 subprocess.run(conv_cmd, check=True, timeout=30)
                 if not os.path.exists(output_path):
                     raise RuntimeError(f"ffmpeg conversion failed: {output_path} was not created")
@@ -1262,9 +1271,20 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV — all need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "kittentts", "moss"):
+        if provider in ("edge", "neutts", "minimax", "xai", "kittentts"):
             if file_str.endswith(".ogg"):
                 voice_compatible = True
+            else:
+                opus_path = _convert_to_opus(file_str)
+                if opus_path:
+                    file_str = opus_path
+                    voice_compatible = True
+        elif provider == "moss":
+            # MOSS needs ffmpeg to produce real Ogg Opus output. Without ffmpeg,
+            # the local fallback is a WAV payload with the requested extension,
+            # which should not be marked as Telegram voice-compatible.
+            if file_str.endswith(".ogg"):
+                voice_compatible = _has_ffmpeg()
             else:
                 opus_path = _convert_to_opus(file_str)
                 if opus_path:

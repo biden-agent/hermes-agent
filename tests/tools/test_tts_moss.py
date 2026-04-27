@@ -151,6 +151,34 @@ class TestGenerateMossTts:
         assert synth_kwargs["seed"] == 7
         assert (tmp_path / "out.ogg").exists()
 
+    def test_ogg_conversion_uses_opus_codec(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        fake_runtime = MagicMock()
+
+        def fake_synthesize(**kwargs):
+            wav_path = kwargs["output_audio_path"]
+            with open(wav_path, "wb") as f:
+                f.write(b"RIFF\x00\x00\x00\x00WAVEfmt fake")
+
+        fake_runtime.synthesize.side_effect = fake_synthesize
+        fake_runtime_cls = MagicMock(return_value=fake_runtime)
+        ffmpeg_calls = []
+
+        def fake_run(cmd, check=False, timeout=None, **kwargs):
+            ffmpeg_calls.append(cmd)
+            with open(cmd[-1], "wb") as f:
+                f.write(b"fake-ogg-data")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: fake_runtime_cls)
+        monkeypatch.setattr(_tt.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+        monkeypatch.setattr(_tt.subprocess, "run", fake_run)
+
+        _tt._generate_moss_tts("hello", str(tmp_path / "out.ogg"), {})
+
+        assert "libopus" in ffmpeg_calls[0]
+
 
 class TestDispatcherBranch:
     def test_moss_not_installed_returns_helpful_error(self, monkeypatch, tmp_path):
@@ -170,6 +198,32 @@ class TestDispatcherBranch:
         assert result["success"] is False
         assert "moss" in result["error"].lower()
         assert "moss-tts-nano" in result["error"].lower()
+
+    def test_ogg_output_without_ffmpeg_is_not_marked_voice_compatible(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        import yaml
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"tts": {"provider": "moss"}}),
+            encoding="utf-8",
+        )
+
+        from tools import tts_tool as _tt
+
+        def fake_generate(_text, out_path, _cfg):
+            with open(out_path, "wb") as f:
+                f.write(b"not-opus")
+            return out_path
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: object)
+        monkeypatch.setattr(_tt, "_generate_moss_tts", fake_generate)
+        monkeypatch.setattr(_tt, "_has_ffmpeg", lambda: False)
+
+        result = json.loads(_tt.text_to_speech_tool(text="Hello", output_path=str(tmp_path / "out.ogg")))
+
+        assert result["success"] is True
+        assert result["voice_compatible"] is False
+        assert "[[audio_as_voice]]" not in result["media_tag"]
 
 
 class TestRequirements:
