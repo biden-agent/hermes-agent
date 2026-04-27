@@ -1,6 +1,7 @@
 """Tests for the MOSS-TTS-Nano local provider in tools/tts_tool.py."""
 
 import json
+import os
 from unittest.mock import MagicMock
 
 import pytest
@@ -251,3 +252,87 @@ class TestRequirements:
         monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
 
         assert _tt.check_tts_requirements() is True
+
+
+class TestMossOutputValidation:
+    """Tests for 8a79a070 output validation fixes."""
+
+    def test_synthesize_without_output_file_raises_runtime_error(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        fake_runtime = MagicMock()
+        fake_runtime.synthesize.return_value = None
+        fake_runtime_cls = MagicMock(return_value=fake_runtime)
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: fake_runtime_cls)
+        monkeypatch.setattr(_tt.shutil, "which", lambda name: None)
+
+        output_path = str(tmp_path / "out.mp3")
+        with pytest.raises(RuntimeError, match="synthesize completed but output file was not created"):
+            _tt._generate_moss_tts("hello", output_path, {})
+
+    def test_ffmpeg_failure_raises_runtime_error(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        fake_runtime = MagicMock()
+
+        def fake_synthesize(**kwargs):
+            wav_path = kwargs["output_audio_path"]
+            with open(wav_path, "wb") as f:
+                f.write(b"RIFF\x00\x00\x00\x00WAVEfmt fake")
+
+        fake_runtime.synthesize.side_effect = fake_synthesize
+        fake_runtime_cls = MagicMock(return_value=fake_runtime)
+
+        def fake_run(cmd, check=False, timeout=None, **kwargs):
+            # Simulate ffmpeg running but NOT creating output (e.g. disk full)
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: fake_runtime_cls)
+        monkeypatch.setattr(_tt.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+        monkeypatch.setattr(_tt.subprocess, "run", fake_run)
+
+        output_path = str(tmp_path / "out.mp3")
+        with pytest.raises(RuntimeError, match="ffmpeg conversion failed"):
+            _tt._generate_moss_tts("hello", output_path, {})
+
+    def test_missing_final_output_raises_runtime_error(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        fake_runtime = MagicMock()
+
+        def fake_synthesize(**kwargs):
+            wav_path = kwargs["output_audio_path"]
+            with open(wav_path, "wb") as f:
+                f.write(b"RIFF\x00\x00\x00\x00WAVEfmt fake")
+
+        fake_runtime.synthesize.side_effect = fake_synthesize
+        fake_runtime_cls = MagicMock(return_value=fake_runtime)
+
+        def fake_run(cmd, check=False, timeout=None, **kwargs):
+            out_path = cmd[-1]
+            with open(out_path, "wb") as f:
+                f.write(b"fake-mp3-data")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: fake_runtime_cls)
+        monkeypatch.setattr(_tt.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+        monkeypatch.setattr(_tt.subprocess, "run", fake_run)
+
+        # When finally block removes the temp wav, also nuke the output file
+        # to simulate a race condition / external deletion.
+        original_remove = os.remove
+        output_path = str(tmp_path / "out.mp3")
+
+        def fake_remove(path):
+            if str(path).endswith(".wav"):
+                try:
+                    original_remove(output_path)
+                except FileNotFoundError:
+                    pass
+            original_remove(path)
+
+        monkeypatch.setattr(_tt.os, "remove", fake_remove)
+
+        with pytest.raises(RuntimeError, match="TTS output file missing after generation"):
+            _tt._generate_moss_tts("hello", output_path, {})
