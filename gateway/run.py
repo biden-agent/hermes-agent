@@ -5426,7 +5426,8 @@ class GatewayRunner:
 
         # Check if there's an active agent
         session_key = session_entry.session_key
-        is_running = session_key in self._running_agents
+        running_agent = self._running_agents.get(session_key)
+        is_running = running_agent in self._running_agents.values() and running_agent is not _AGENT_PENDING_SENTINEL
 
         # Count pending /queue follow-ups (slot + overflow).
         adapter = self.adapters.get(source.platform) if source else None
@@ -5439,6 +5440,42 @@ class GatewayRunner:
             except Exception:
                 title = None
 
+        model_name = None
+        provider_name = None
+        base_url = None
+
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            model_name = str(getattr(running_agent, "model", "") or "") or None
+            provider_name = str(getattr(running_agent, "provider", "") or "") or None
+            base_url = str(getattr(running_agent, "base_url", "") or "") or None
+        else:
+            _cache_lock = getattr(self, "_agent_cache_lock", None)
+            _cache = getattr(self, "_agent_cache", None)
+            cached_agent = None
+            if _cache_lock and _cache is not None:
+                with _cache_lock:
+                    cached = _cache.get(session_key)
+                    cached_agent = cached[0] if isinstance(cached, tuple) else cached if cached else None
+            if cached_agent is not None:
+                model_name = str(getattr(cached_agent, "model", "") or "") or None
+                provider_name = str(getattr(cached_agent, "provider", "") or "") or None
+                base_url = str(getattr(cached_agent, "base_url", "") or "") or None
+
+        if not model_name or not provider_name:
+            try:
+                from hermes_cli.config import load_config as _load_user_config
+                _user_cfg = _load_user_config() or {}
+                resolved_model, runtime_kwargs = self._resolve_session_agent_runtime(
+                    source=source,
+                    session_key=session_key,
+                    user_config=_user_cfg,
+                )
+                model_name = model_name or str(resolved_model or "") or None
+                provider_name = provider_name or str(runtime_kwargs.get("provider") or "") or None
+                base_url = base_url or str(runtime_kwargs.get("base_url") or "") or None
+            except Exception:
+                pass
+
         lines = [
             "📊 **Hermes Gateway Status**",
             "",
@@ -5450,8 +5487,17 @@ class GatewayRunner:
             f"**Created:** {session_entry.created_at.strftime('%Y-%m-%d %H:%M')}",
             f"**Last Activity:** {session_entry.updated_at.strftime('%Y-%m-%d %H:%M')}",
             f"**Tokens:** {session_entry.total_tokens:,}",
-            f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}",
         ])
+        if model_name:
+            if provider_name:
+                lines.append(f"**Model:** `{provider_name} / {model_name}`")
+            else:
+                lines.append(f"**Model:** `{model_name}`")
+        elif provider_name:
+            lines.append(f"**Provider:** `{provider_name}`")
+        if base_url:
+            lines.append(f"**Base URL:** `{base_url}`")
+        lines.append(f"**Agent Running:** {'Yes ⚡' if is_running else 'No'}")
         if queue_depth:
             lines.append(f"**Queued follow-ups:** {queue_depth}")
         lines.extend([
