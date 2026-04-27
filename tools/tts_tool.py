@@ -2,14 +2,17 @@
 """
 Text-to-Speech Tool Module
 
-Supports seven TTS providers:
+Supports ten TTS providers:
 - Edge TTS (default, free, no API key): Microsoft Edge neural voices
 - ElevenLabs (premium): High-quality voices, needs ELEVENLABS_API_KEY
 - OpenAI TTS: Good quality, needs OPENAI_API_KEY
+- xAI TTS: Grok voices, needs XAI_API_KEY
 - MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts_cli, needs neutts installed
+- KittenTTS (local, free, no API key): Lightweight CPU TTS via kittentts
+- MOSS-TTS-Nano (local, free, no API key): ONNX CPU TTS with voice cloning
 
 Output formats:
 - Opus (.ogg) for Telegram voice bubbles (requires ffmpeg for Edge TTS)
@@ -26,7 +29,10 @@ Usage:
 
 import asyncio
 import base64
+import contextlib
 import datetime
+import importlib
+import importlib.util
 import json
 import logging
 import os
@@ -40,6 +46,7 @@ import uuid
 from pathlib import Path
 from typing import Callable, Dict, Any, Optional
 from urllib.parse import urljoin
+import sys
 
 from hermes_constants import display_hermes_home
 
@@ -83,6 +90,69 @@ def _import_kittentts():
     """Lazy import KittenTTS. Returns the class or raises ImportError."""
     from kittentts import KittenTTS
     return KittenTTS
+
+
+@contextlib.contextmanager
+def _prepend_sys_path(path: Path):
+    """Temporarily prepend *path* to sys.path for local module imports."""
+    path_str = str(path)
+    inserted = False
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
+        inserted = True
+    try:
+        yield
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(path_str)
+            except ValueError:
+                pass
+
+
+def _moss_repo_root() -> Path:
+    """Return the bundled MOSS-TTS-Nano repository path."""
+    return Path(__file__).resolve().parent.parent / "moss_tts_nano_repo"
+
+
+def _import_moss_onnx_runtime():
+    """Lazy import the bundled MOSS ONNX runtime class."""
+    repo_root = _moss_repo_root()
+    if not repo_root.is_dir():
+        raise FileNotFoundError(f"Bundled MOSS repo not found: {repo_root}")
+    module_path = repo_root / "onnx_tts_runtime.py"
+    if not module_path.is_file():
+        raise FileNotFoundError(f"Bundled MOSS runtime module not found: {module_path}")
+    with _prepend_sys_path(repo_root):
+        spec = importlib.util.spec_from_file_location(
+            "_hermes_moss_onnx_tts_runtime", module_path
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Could not load MOSS runtime module from {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    runtime_cls = getattr(module, "OnnxTtsRuntime", None)
+    if runtime_cls is None:
+        raise ImportError("Bundled MOSS runtime does not export OnnxTtsRuntime")
+    return runtime_cls
+
+
+def _coerce_bool_config(value: Any, default: bool) -> bool:
+    """Coerce config values to bool without treating non-empty strings as truthy."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return default
 
 
 # ===========================================================================
@@ -139,6 +209,7 @@ PROVIDER_MAX_TEXT_LENGTH: Dict[str, int] = {
     "elevenlabs": 10000,  # fallback when model-aware lookup can't resolve (multilingual_v2)
     "neutts": 2000,       # local model, quality falls off on long text
     "kittentts": 2000,    # local 25MB model
+    "moss": 2000,         # local ONNX model, keep voice-clone prompts short
 }
 
 # ElevenLabs caps vary by model_id. https://elevenlabs.io/docs/overview/models
@@ -785,6 +856,15 @@ def _check_kittentts_available() -> bool:
         return False
 
 
+def _check_moss_available() -> bool:
+    """Check if the bundled MOSS runtime and its dependencies are importable."""
+    try:
+        _import_moss_onnx_runtime()
+        return Path(_default_moss_ref_audio()).is_file()
+    except Exception:
+        return False
+
+
 def _default_neutts_ref_audio() -> str:
     """Return path to the bundled default voice reference audio."""
     return str(Path(__file__).parent / "neutts_samples" / "jo.wav")
@@ -793,6 +873,11 @@ def _default_neutts_ref_audio() -> str:
 def _default_neutts_ref_text() -> str:
     """Return path to the bundled default voice reference transcript."""
     return str(Path(__file__).parent / "neutts_samples" / "jo.txt")
+
+
+def _default_moss_ref_audio() -> str:
+    """Return path to the bundled default MOSS voice-clone reference audio."""
+    return str(_moss_repo_root() / "assets" / "audio" / "zh_1.wav")
 
 
 def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
@@ -907,6 +992,77 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
         else:
             # No ffmpeg — rename the WAV to the expected path
             os.rename(wav_path, output_path)
+
+    return output_path
+
+
+def _generate_moss_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -> str:
+    """Generate speech using the bundled MOSS-TTS-Nano ONNX runtime."""
+    OnnxTtsRuntime = _import_moss_onnx_runtime()
+    moss_config = tts_config.get("moss", {})
+    model_dir = moss_config.get("model_dir") or None
+    prompt_audio = moss_config.get("prompt_audio", "") or _default_moss_ref_audio()
+    cpu_threads = int(moss_config.get("cpu_threads", 4))
+    sample_mode = moss_config.get("sample_mode", "fixed")
+    do_sample = _coerce_bool_config(moss_config.get("do_sample"), True)
+    streaming = _coerce_bool_config(moss_config.get("streaming"), False)
+    max_new_frames = moss_config.get("max_new_frames")
+    voice_clone_max_text_tokens = int(moss_config.get("voice_clone_max_text_tokens", 75))
+    enable_wetext = _coerce_bool_config(moss_config.get("enable_wetext_processing"), False)
+    enable_normalize_tts_text = _coerce_bool_config(
+        moss_config.get("enable_normalize_tts_text"), False
+    )
+    seed = moss_config.get("seed")
+
+    if cpu_threads < 1:
+        raise ValueError("MOSS cpu_threads must be >= 1")
+    if voice_clone_max_text_tokens < 1:
+        raise ValueError("MOSS voice_clone_max_text_tokens must be >= 1")
+    if sample_mode not in {"greedy", "fixed", "full"}:
+        raise ValueError("MOSS sample_mode must be one of: greedy, fixed, full")
+
+    if not os.path.exists(prompt_audio):
+        raise FileNotFoundError(f"MOSS reference audio not found: {prompt_audio}")
+
+    wav_path = output_path
+    if not output_path.endswith(".wav"):
+        wav_path = output_path.rsplit(".", 1)[0] + ".wav"
+
+    runtime = OnnxTtsRuntime(
+        model_dir=model_dir,
+        thread_count=cpu_threads,
+        max_new_frames=max_new_frames,
+        do_sample=do_sample,
+        sample_mode=sample_mode,
+    )
+    try:
+        runtime.synthesize(
+            text=text,
+            prompt_audio_path=prompt_audio,
+            output_audio_path=wav_path,
+            sample_mode=sample_mode,
+            do_sample=do_sample,
+            streaming=streaming,
+            max_new_frames=max_new_frames,
+            voice_clone_max_text_tokens=voice_clone_max_text_tokens,
+            enable_wetext=enable_wetext,
+            enable_normalize_tts_text=enable_normalize_tts_text,
+            seed=seed,
+        )
+
+        if wav_path != output_path:
+            ffmpeg = shutil.which("ffmpeg")
+            if ffmpeg:
+                conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", output_path]
+                subprocess.run(conv_cmd, check=True, timeout=30)
+            else:
+                os.replace(wav_path, output_path)
+    finally:
+        if wav_path != output_path and os.path.exists(wav_path):
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
 
     return output_path
 
@@ -1044,9 +1200,20 @@ def text_to_speech_tool(
                     "error": "KittenTTS provider selected but 'kittentts' package not installed. "
                              "Run 'hermes setup tts' and choose KittenTTS, or install manually: "
                              "pip install https://github.com/KittenML/KittenTTS/releases/download/0.8.1/kittentts-0.8.1-py3-none-any.whl"
-                }, ensure_ascii=False)
+                 }, ensure_ascii=False)
             logger.info("Generating speech with KittenTTS (local, ~25MB)...")
             _generate_kittentts(text, file_str, tts_config)
+
+        elif provider == "moss":
+            try:
+                _import_moss_onnx_runtime()
+            except Exception:
+                return json.dumps({
+                    "success": False,
+                    "error": "MOSS provider selected but MOSS-TTS-Nano dependencies are not installed. Run `source venv/bin/activate && pip install sentencepiece torchaudio`."
+                }, ensure_ascii=False)
+            logger.info("Generating speech with MOSS-TTS-Nano (local ONNX CPU)...")
+            _generate_moss_tts(text, file_str, tts_config)
 
         else:
             # Default: Edge TTS (free), with NeuTTS as local fallback
@@ -1087,11 +1254,14 @@ def text_to_speech_tool(
         # Try Opus conversion for Telegram compatibility
         # Edge TTS outputs MP3, NeuTTS/KittenTTS output WAV — all need ffmpeg conversion
         voice_compatible = False
-        if provider in ("edge", "neutts", "minimax", "xai", "kittentts") and not file_str.endswith(".ogg"):
-            opus_path = _convert_to_opus(file_str)
-            if opus_path:
-                file_str = opus_path
+        if provider in ("edge", "neutts", "minimax", "xai", "kittentts", "moss"):
+            if file_str.endswith(".ogg"):
                 voice_compatible = True
+            else:
+                opus_path = _convert_to_opus(file_str)
+                if opus_path:
+                    file_str = opus_path
+                    voice_compatible = True
         elif provider in ("elevenlabs", "openai", "mistral", "gemini"):
             voice_compatible = file_str.endswith(".ogg")
 
@@ -1173,6 +1343,8 @@ def check_tts_requirements() -> bool:
     if _check_neutts_available():
         return True
     if _check_kittentts_available():
+        return True
+    if _check_moss_available():
         return True
     return False
 
@@ -1471,6 +1643,7 @@ if __name__ == "__main__":
         f"{'set' if resolve_openai_audio_api_key() else 'not set (VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY)'}"
     )
     print(f"  MiniMax:    {'API key set' if os.getenv('MINIMAX_API_KEY') else 'not set (MINIMAX_API_KEY)'}")
+    print(f"  MOSS:       {'installed' if _check_moss_available() else 'not installed (sentencepiece + torchaudio missing?)'}")
     print(f"  ffmpeg:     {'✅ found' if _has_ffmpeg() else '❌ not found (needed for Telegram Opus)'}")
     print(f"\n  Output dir: {DEFAULT_OUTPUT_DIR}")
 

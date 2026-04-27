@@ -1,0 +1,199 @@
+"""Tests for the MOSS-TTS-Nano local provider in tools/tts_tool.py."""
+
+import json
+from unittest.mock import MagicMock
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def clean_env(monkeypatch):
+    monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
+
+
+class TestGenerateMossTts:
+    def test_import_uses_bundled_runtime_path(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        repo_root = tmp_path / "moss_tts_nano_repo"
+        repo_root.mkdir()
+        module_path = repo_root / "onnx_tts_runtime.py"
+        module_path.write_text(
+            "class OnnxTtsRuntime:\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(_tt, "_moss_repo_root", lambda: repo_root)
+        sys_modules = __import__("sys").modules
+        sys_modules["onnx_tts_runtime"] = type("PoisonedModule", (), {"OnnxTtsRuntime": object})()
+
+        runtime_cls = _tt._import_moss_onnx_runtime()
+
+        assert runtime_cls.__name__ == "OnnxTtsRuntime"
+        assert runtime_cls.__module__ == "_hermes_moss_onnx_tts_runtime"
+
+    def test_successful_mp3_generation_uses_default_reference_audio(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        fake_runtime = MagicMock()
+
+        def fake_synthesize(**kwargs):
+            wav_path = kwargs["output_audio_path"]
+            with open(wav_path, "wb") as f:
+                f.write(b"RIFF\x00\x00\x00\x00WAVEfmt fake")
+            return {"audio_path": wav_path, "sample_rate": 24000}
+
+        fake_runtime.synthesize.side_effect = fake_synthesize
+        fake_runtime_cls = MagicMock(return_value=fake_runtime)
+
+        ffmpeg_calls = []
+
+        def fake_run(cmd, check=False, timeout=None, **kwargs):
+            ffmpeg_calls.append(cmd)
+            out_path = cmd[-1]
+            with open(out_path, "wb") as f:
+                f.write(b"fake-mp3-data")
+            return MagicMock(returncode=0)
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: fake_runtime_cls)
+        monkeypatch.setattr(_tt.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+        monkeypatch.setattr(_tt.subprocess, "run", fake_run)
+
+        output_path = str(tmp_path / "out.mp3")
+        result = _tt._generate_moss_tts("你好，世界", output_path, {})
+
+        assert result == output_path
+        assert (tmp_path / "out.mp3").exists()
+        fake_runtime_cls.assert_called_once()
+        synth_kwargs = fake_runtime.synthesize.call_args.kwargs
+        assert synth_kwargs["text"] == "你好，世界"
+        assert synth_kwargs["prompt_audio_path"] == _tt._default_moss_ref_audio()
+        assert synth_kwargs["output_audio_path"].endswith(".wav")
+        assert ffmpeg_calls[0][0] == "/usr/bin/ffmpeg"
+
+    def test_failed_ffmpeg_conversion_cleans_up_temp_wav(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        fake_runtime = MagicMock()
+
+        def fake_synthesize(**kwargs):
+            wav_path = kwargs["output_audio_path"]
+            with open(wav_path, "wb") as f:
+                f.write(b"RIFF\x00\x00\x00\x00WAVEfmt fake")
+
+        fake_runtime.synthesize.side_effect = fake_synthesize
+        fake_runtime_cls = MagicMock(return_value=fake_runtime)
+
+        def fake_run(*args, **kwargs):
+            raise _tt.subprocess.CalledProcessError(1, args[0])
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: fake_runtime_cls)
+        monkeypatch.setattr(_tt.shutil, "which", lambda name: "/usr/bin/ffmpeg" if name == "ffmpeg" else None)
+        monkeypatch.setattr(_tt.subprocess, "run", fake_run)
+
+        output_path = tmp_path / "out.mp3"
+        with pytest.raises(_tt.subprocess.CalledProcessError):
+            _tt._generate_moss_tts("hello", str(output_path), {})
+
+        assert not (tmp_path / "out.wav").exists()
+
+    def test_custom_config_is_passed_to_runtime(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        fake_runtime = MagicMock()
+
+        def fake_synthesize(**kwargs):
+            wav_path = kwargs["output_audio_path"]
+            with open(wav_path, "wb") as f:
+                f.write(b"RIFF\x00\x00\x00\x00WAVEfmt fake")
+            return {"audio_path": wav_path, "sample_rate": 24000}
+
+        fake_runtime.synthesize.side_effect = fake_synthesize
+        fake_runtime_cls = MagicMock(return_value=fake_runtime)
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: fake_runtime_cls)
+        monkeypatch.setattr(_tt.shutil, "which", lambda name: None)
+
+        config = {
+            "moss": {
+                "model_dir": str(tmp_path / "models"),
+                "prompt_audio": str(tmp_path / "speaker.wav"),
+                "cpu_threads": 2,
+                "sample_mode": "greedy",
+                "do_sample": False,
+                "streaming": True,
+                "max_new_frames": 111,
+                "voice_clone_max_text_tokens": 33,
+                "enable_wetext_processing": False,
+                "enable_normalize_tts_text": False,
+                "seed": 7,
+            }
+        }
+        (tmp_path / "speaker.wav").write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt fake")
+        output_path = str(tmp_path / "out.ogg")
+        result = _tt._generate_moss_tts("hello", output_path, config)
+
+        assert result == output_path
+        fake_runtime_cls.assert_called_once_with(
+            model_dir=str(tmp_path / "models"),
+            thread_count=2,
+            max_new_frames=111,
+            do_sample=False,
+            sample_mode="greedy",
+        )
+        synth_kwargs = fake_runtime.synthesize.call_args.kwargs
+        assert synth_kwargs["prompt_audio_path"] == str(tmp_path / "speaker.wav")
+        assert synth_kwargs["streaming"] is True
+        assert synth_kwargs["voice_clone_max_text_tokens"] == 33
+        assert synth_kwargs["enable_wetext"] is False
+        assert synth_kwargs["enable_normalize_tts_text"] is False
+        assert synth_kwargs["seed"] == 7
+        assert (tmp_path / "out.ogg").exists()
+
+
+class TestDispatcherBranch:
+    def test_moss_not_installed_returns_helpful_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        import yaml
+        (tmp_path / "config.yaml").write_text(
+            yaml.safe_dump({"tts": {"provider": "moss"}}),
+            encoding="utf-8",
+        )
+
+        from tools import tts_tool as _tt
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: (_ for _ in ()).throw(ImportError("no moss")))
+
+        result = json.loads(_tt.text_to_speech_tool(text="Hello"))
+        assert result["success"] is False
+        assert "moss" in result["error"].lower()
+        assert "moss-tts-nano" in result["error"].lower()
+
+
+class TestRequirements:
+    def test_check_moss_available_requires_default_reference_audio(self, tmp_path, monkeypatch):
+        from tools import tts_tool as _tt
+
+        monkeypatch.setattr(_tt, "_import_moss_onnx_runtime", lambda: object)
+        monkeypatch.setattr(_tt, "_default_moss_ref_audio", lambda: str(tmp_path / "missing.wav"))
+
+        assert _tt._check_moss_available() is False
+
+    def test_check_tts_requirements_accepts_moss_when_other_providers_missing(self, monkeypatch):
+        from tools import tts_tool as _tt
+
+        monkeypatch.setattr(_tt, "_import_edge_tts", lambda: (_ for _ in ()).throw(ImportError("no edge")))
+        monkeypatch.setattr(_tt, "_import_elevenlabs", lambda: (_ for _ in ()).throw(ImportError("no elevenlabs")))
+        monkeypatch.setattr(_tt, "_import_openai_client", lambda: (_ for _ in ()).throw(ImportError("no openai")))
+        monkeypatch.setattr(_tt, "_import_mistral_client", lambda: (_ for _ in ()).throw(ImportError("no mistral")))
+        monkeypatch.setattr(_tt, "_check_neutts_available", lambda: False)
+        monkeypatch.setattr(_tt, "_check_kittentts_available", lambda: False)
+        monkeypatch.setattr(_tt, "_check_moss_available", lambda: True)
+        monkeypatch.delenv("MINIMAX_API_KEY", raising=False)
+        monkeypatch.delenv("XAI_API_KEY", raising=False)
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
+        assert _tt.check_tts_requirements() is True

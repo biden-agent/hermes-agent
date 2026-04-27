@@ -475,6 +475,17 @@ def _print_setup_summary(config: dict, hermes_home):
             tool_status.append(("Text-to-Speech (KittenTTS local)", True, None))
         else:
             tool_status.append(("Text-to-Speech (KittenTTS — not installed)", False, "run 'hermes setup tts'"))
+    elif tts_provider == "moss":
+        try:
+            from tools.tts_tool import _check_moss_available
+
+            moss_ok = _check_moss_available()
+        except Exception:
+            moss_ok = False
+        if moss_ok:
+            tool_status.append(("Text-to-Speech (MOSS-TTS-Nano local)", True, None))
+        else:
+            tool_status.append(("Text-to-Speech (MOSS-TTS-Nano — not installed)", False, "run 'hermes setup tts'"))
     else:
         tool_status.append(("Text-to-Speech (Edge TTS)", True, None))
 
@@ -986,6 +997,7 @@ def _setup_tts_provider(config: dict):
         "gemini": "Google Gemini TTS",
         "neutts": "NeuTTS",
         "kittentts": "KittenTTS",
+        "moss": "MOSS-TTS-Nano",
     }
     current_label = provider_labels.get(current_provider, current_provider)
 
@@ -1010,9 +1022,10 @@ def _setup_tts_provider(config: dict):
             "Google Gemini TTS (30 prebuilt voices, prompt-controllable, needs API key)",
             "NeuTTS (local on-device, free, ~300MB model download)",
             "KittenTTS (local on-device, free, lightweight ~25-80MB ONNX)",
+            "MOSS-TTS-Nano (local ONNX CPU, voice cloning with bundled reference audio)",
         ]
     )
-    providers.extend(["edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts"])
+    providers.extend(["edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "moss"])
     choices.append(f"Keep current ({current_label})")
     keep_current_idx = len(choices) - 1
     idx = prompt_choice("Select TTS provider:", choices, keep_current_idx)
@@ -1153,6 +1166,24 @@ def _setup_tts_provider(config: dict):
             else:
                 print_info("Skipping install. Set tts.provider to 'kittentts' after installing manually.")
                 selected = "edge"
+
+    elif selected == "moss":
+        try:
+            from tools.tts_tool import _check_moss_available
+
+            moss_available = _check_moss_available()
+        except Exception:
+            moss_available = False
+
+        if moss_available:
+            print_success("MOSS-TTS-Nano integration is available")
+        else:
+            print()
+            print_warning("MOSS-TTS-Nano is not ready yet in this checkout.")
+            print_info("It requires the bundled moss_tts_nano_repo submodule plus local Python deps.")
+            print_info("Install the submodule and dependencies, then re-run 'hermes setup tts'.")
+            print_info("Typical deps: sentencepiece, torchaudio")
+            selected = "edge"
 
     # Save the selection
     if "tts" not in config:
