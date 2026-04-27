@@ -309,6 +309,56 @@ class TestWeixinSendMessageIntegration:
         )
 
 
+class TestFeishuSendMessageIntegration:
+    @patch("tools.send_message_tool._send_feishu", new_callable=AsyncMock)
+    def test_send_to_platform_routes_feishu_media_to_native_helper(self, send_feishu_mock):
+        send_feishu_mock.return_value = {"success": True, "platform": "feishu", "chat_id": "oc_123"}
+        config = PlatformConfig(enabled=True, token="bot-token", extra={"app_id": "cli_a", "app_secret": "cli_s"})
+
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.FEISHU,
+                config,
+                "oc_123",
+                "hello",
+                media_files=[("/tmp/demo.mp3", False)],
+            )
+        )
+
+        assert result["success"] is True
+        send_feishu_mock.assert_awaited_once_with(
+            config,
+            "oc_123",
+            "hello",
+            media_files=[("/tmp/demo.mp3", False)],
+            thread_id=None,
+        )
+
+    @patch("tools.send_message_tool._send_feishu", new_callable=AsyncMock)
+    def test_send_to_platform_routes_feishu_media_only_to_native_helper(self, send_feishu_mock):
+        send_feishu_mock.return_value = {"success": True, "platform": "feishu", "chat_id": "oc_123", "message_id": "mid-1"}
+        config = PlatformConfig(enabled=True, token="bot-token", extra={"app_id": "cli_a", "app_secret": "cli_s"})
+
+        result = asyncio.run(
+            _send_to_platform(
+                Platform.FEISHU,
+                config,
+                "oc_123",
+                "",
+                media_files=[("/tmp/demo.mp3", True)],
+            )
+        )
+
+        assert result["success"] is True
+        send_feishu_mock.assert_awaited_once_with(
+            config,
+            "oc_123",
+            "",
+            media_files=[("/tmp/demo.mp3", True)],
+            thread_id=None,
+        )
+
+
 class TestWeixinChunkDelivery:
     def _connected_adapter(self) -> WeixinAdapter:
         adapter = _make_adapter()

@@ -56,6 +56,10 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -1825,7 +1829,7 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio to Feishu as a file attachment plus optional caption."""
+        """Send audio to Feishu as a native audio message when possible."""
         return await self._send_uploaded_file_message(
             chat_id=chat_id,
             file_path=audio_path,
@@ -1833,6 +1837,7 @@ class FeishuAdapter(BasePlatformAdapter):
             metadata=metadata,
             caption=caption,
             outbound_message_type="audio",
+            prefer_native_audio=True,
         )
 
     async def send_document(
@@ -3867,6 +3872,7 @@ class FeishuAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         outbound_message_type: str = "file",
+        prefer_native_audio: bool = False,
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="Not connected")
@@ -3878,12 +3884,27 @@ class FeishuAdapter(BasePlatformAdapter):
             file_path=display_name,
             requested_message_type=outbound_message_type,
         )
+        upload_path = file_path
+        cleanup_upload = None
+        upload_duration_ms: Optional[int] = None
+        if prefer_native_audio:
+            try:
+                upload_path, upload_duration_ms, cleanup_upload = self._prepare_voice_message_asset(file_path)
+                display_name = os.path.basename(upload_path)
+                upload_file_type, resolved_message_type = self._resolve_outbound_file_routing(
+                    file_path=display_name,
+                    requested_message_type=outbound_message_type,
+                )
+            except Exception as exc:
+                logger.warning("[Feishu] Failed to prepare native audio asset %s: %s", file_path, exc, exc_info=True)
+                return SendResult(success=False, error=str(exc))
         try:
-            with open(file_path, "rb") as file_obj:
+            with open(upload_path, "rb") as file_obj:
                 body = self._build_file_upload_body(
                     file_type=upload_file_type,
                     file_name=display_name,
                     file=file_obj,
+                    duration=upload_duration_ms,
                 )
                 request = self._build_file_upload_request(body)
                 upload_response = await asyncio.to_thread(self._client.im.v1.file.create, request)
@@ -3920,6 +3941,12 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+        finally:
+            if cleanup_upload:
+                try:
+                    cleanup_upload()
+                except Exception:
+                    logger.debug("[Feishu] Failed to clean up temporary audio asset %s", upload_path, exc_info=True)
 
     async def _send_raw_message(
         self,
@@ -4270,16 +4297,21 @@ class FeishuAdapter(BasePlatformAdapter):
         return SimpleNamespace(request_body=request_body)
 
     @staticmethod
-    def _build_file_upload_body(*, file_type: str, file_name: str, file: Any) -> Any:
+    def _build_file_upload_body(*, file_type: str, file_name: str, file: Any, duration: Optional[int] = None) -> Any:
         if "CreateFileRequestBody" in globals():
-            return (
+            builder = (
                 CreateFileRequestBody.builder()
                 .file_type(file_type)
                 .file_name(file_name)
                 .file(file)
-                .build()
             )
-        return SimpleNamespace(file_type=file_type, file_name=file_name, file=file)
+            if duration is not None:
+                builder = builder.duration(duration)
+            return builder.build()
+        body = SimpleNamespace(file_type=file_type, file_name=file_name, file=file)
+        if duration is not None:
+            body.duration = duration
+        return body
 
     @staticmethod
     def _build_file_upload_request(request_body: Any) -> Any:
@@ -4313,10 +4345,106 @@ class FeishuAdapter(BasePlatformAdapter):
         if ext in _FEISHU_DOC_UPLOAD_TYPES:
             return _FEISHU_DOC_UPLOAD_TYPES[ext], "file"
 
+        if requested_message_type == "audio":
+            return _FEISHU_FILE_UPLOAD_TYPE, "audio"
+
         if requested_message_type == "file":
             return _FEISHU_FILE_UPLOAD_TYPE, "file"
 
         return _FEISHU_FILE_UPLOAD_TYPE, "file"
+
+    @staticmethod
+    def _prepare_voice_message_asset(audio_path: str) -> tuple[str, Optional[int], Optional[callable]]:
+        ext = Path(audio_path).suffix.lower()
+        if ext in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
+            return audio_path, FeishuAdapter._probe_audio_duration_ms_best_effort(audio_path), None
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffmpeg_path:
+            raise RuntimeError("ffmpeg is required to convert audio into Feishu native voice format")
+        if not ffprobe_path:
+            raise RuntimeError("ffprobe is required to measure Feishu voice duration")
+
+        fd, converted_path = tempfile.mkstemp(prefix="feishu-voice-", suffix=".opus")
+        os.close(fd)
+        try:
+            subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-y",
+                    "-i",
+                    audio_path,
+                    "-vn",
+                    "-acodec",
+                    "libopus",
+                    "-b:a",
+                    "32k",
+                    "-ac",
+                    "1",
+                    converted_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    converted_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            duration_text = (probe.stdout or "").strip()
+            duration_ms = max(1, int(round(float(duration_text) * 1000))) if duration_text else None
+        except Exception:
+            if os.path.exists(converted_path):
+                os.unlink(converted_path)
+            raise
+
+        def _cleanup() -> None:
+            if os.path.exists(converted_path):
+                os.unlink(converted_path)
+
+        return converted_path, duration_ms, _cleanup
+
+    @staticmethod
+    def _probe_audio_duration_ms_best_effort(audio_path: str) -> Optional[int]:
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffprobe_path:
+            return None
+
+        try:
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    audio_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            duration_text = (probe.stdout or "").strip()
+            return max(1, int(round(float(duration_text) * 1000))) if duration_text else None
+        except Exception:
+            return None
 
 
 # =============================================================================
