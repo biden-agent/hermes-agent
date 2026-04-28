@@ -797,6 +797,7 @@ class GatewayRunner:
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        self._process_watcher_tasks: Dict[str, asyncio.Task] = {}
 
 
     def _warn_if_docker_media_delivery_is_risky(self) -> None:
@@ -1234,19 +1235,20 @@ class GatewayRunner:
         # process to pick up.  "interrupt" mode drops them (current behaviour).
         return self._restart_requested and self._busy_input_mode in ("queue", "steer")
 
-    # -------- /queue FIFO helpers --------------------------------------
+    # -------- Deferred follow-up FIFO helpers --------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
-    # order, with no merging.  The adapter's _pending_messages dict is a
-    # single "next-up" slot (shared with photo-burst follow-ups), so we
-    # use it for the head of the queue and an overflow list for the
-    # tail.  Enqueue puts new items in the slot when free, otherwise in
-    # the overflow.  Promotion (called after each run's drain) moves the
-    # next overflow item into the slot so the following recursion picks
-    # it up.  Clearing happens on /new and /reset via
-    # _handle_reset_command.
+    # order, with no merging. Synthetic internal follow-ups (for example,
+    # background process completions) must preserve the same ordering once
+    # they defer behind an active session. The adapter's _pending_messages
+    # dict is a single "next-up" slot (shared with photo-burst follow-ups),
+    # so we use it for the head of the queue and an overflow list for the
+    # tail. Enqueue puts new items in the slot when free, otherwise in the
+    # overflow. Promotion (called after each run's drain) moves the next
+    # overflow item into the slot so the following recursion picks it up.
+    # Clearing happens on /new and /reset via _handle_reset_command.
 
     def _enqueue_fifo(self, session_key: str, queued_event: "MessageEvent", adapter: Any) -> None:
-        """Append a /queue event to the FIFO chain for a session."""
+        """Append a deferred follow-up event to the FIFO chain for a session."""
         if adapter is None:
             return
         pending_slot = getattr(adapter, "_pending_messages", None)
@@ -1303,6 +1305,69 @@ class GatewayRunner:
         if adapter is not None and session_key in getattr(adapter, "_pending_messages", {}):
             depth += 1
         return depth
+
+    def _track_background_task(self, task: asyncio.Task) -> asyncio.Task:
+        """Keep a background task strongly referenced until it finishes."""
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
+    def _start_process_watcher_task(self, watcher: dict, *, recovered: bool = False) -> bool:
+        """Start a single process watcher task unless one is already active."""
+        session_id = str(watcher.get("session_id") or "").strip()
+        if not session_id:
+            return False
+
+        existing = self._process_watcher_tasks.get(session_id)
+        if existing is not None and not existing.done():
+            logger.debug("Process watcher already running for %s", session_id)
+            return False
+
+        task = asyncio.create_task(self._run_process_watcher(watcher))
+        self._process_watcher_tasks[session_id] = task
+        self._track_background_task(task)
+
+        def _cleanup(_task: asyncio.Task, *, _sid: str = session_id) -> None:
+            current = self._process_watcher_tasks.get(_sid)
+            if current is _task:
+                self._process_watcher_tasks.pop(_sid, None)
+
+        task.add_done_callback(_cleanup)
+        if recovered:
+            logger.info("Resumed watcher for recovered process %s", session_id)
+        return True
+
+    def _drain_process_watcher_registrations(self, *, recovered: bool = False) -> int:
+        """Start watcher tasks for all pending process registrations."""
+        started = 0
+        try:
+            from tools.process_registry import process_registry
+
+            pending_watchers = process_registry.drain_pending_watchers()
+        except Exception as exc:
+            logger.error("Process watcher registry drain error: %s", exc)
+            return 0
+
+        for watcher in pending_watchers:
+            try:
+                if self._start_process_watcher_task(watcher, recovered=recovered):
+                    started += 1
+            except Exception as exc:
+                logger.error(
+                    "Process watcher setup error for %s: %s",
+                    watcher.get("session_id", "unknown"),
+                    exc,
+                )
+        return started
+
+    async def _process_watcher_dispatcher(self, interval: float = 0.5) -> None:
+        """Continuously start watcher tasks as terminal() registers them."""
+        while self._running:
+            try:
+                self._drain_process_watcher_registrations()
+            except Exception as exc:
+                logger.error("Process watcher dispatcher error: %s", exc)
+            await asyncio.sleep(interval)
 
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
@@ -2407,6 +2472,7 @@ class GatewayRunner:
         
         self._running = True
         self._update_runtime_status("running")
+        self._track_background_task(asyncio.create_task(self._process_watcher_dispatcher()))
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -2443,15 +2509,8 @@ class GatewayRunner:
         # Notify the chat that initiated /restart that the gateway is back.
         await self._send_restart_notification()
 
-        # Drain any recovered process watchers (from crash recovery checkpoint)
-        try:
-            from tools.process_registry import process_registry
-            while process_registry.pending_watchers:
-                watcher = process_registry.pending_watchers.pop(0)
-                asyncio.create_task(self._run_process_watcher(watcher))
-                logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
-        except Exception as e:
-            logger.error("Recovered watcher setup error: %s", e)
+        # Start any watcher registrations recovered from the checkpoint.
+        self._drain_process_watcher_registrations(recovered=True)
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
@@ -5085,14 +5144,10 @@ class GatewayRunner:
                 "response": (response or "")[:500],
             })
             
-            # Check for pending process watchers (check_interval on background processes)
-            try:
-                from tools.process_registry import process_registry
-                while process_registry.pending_watchers:
-                    watcher = process_registry.pending_watchers.pop(0)
-                    asyncio.create_task(self._run_process_watcher(watcher))
-            except Exception as e:
-                logger.error("Process watcher setup error: %s", e)
+            # Opportunistic fast-path: the dispatcher loop is the real source
+            # of truth, but draining here keeps completion latency low on
+            # turns that finish immediately after registering a watcher.
+            self._drain_process_watcher_registrations()
 
             # Drain watch pattern notifications that arrived during the agent run.
             # Watch events and completions share the same queue; completions are
@@ -8795,6 +8850,59 @@ class GatewayRunner:
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
+    async def _dispatch_internal_process_event(
+        self,
+        *,
+        adapter: Any,
+        session_id: str,
+        session_key: str,
+        event: MessageEvent,
+    ) -> str:
+        """Deliver or defer a synthetic process event.
+
+        Completion notifications should not interrupt an active user turn by
+        default. When the owning session is busy, queue the synthetic event to
+        run after the current turn chain completes. When the session is idle,
+        dispatch it through the normal adapter pipeline immediately.
+        """
+        if not adapter:
+            return "dropped"
+
+        if session_key and hasattr(adapter, "_heal_stale_session_lock"):
+            try:
+                adapter._heal_stale_session_lock(session_key)
+            except Exception:
+                pass
+
+        has_active_session = bool(
+            session_key and session_key in getattr(adapter, "_active_sessions", {})
+        )
+        has_queued_followups = bool(
+            session_key and self._queue_depth(session_key, adapter=adapter) > 0
+        )
+
+        if has_active_session or has_queued_followups:
+            pending_slot = getattr(adapter, "_pending_messages", None)
+            if pending_slot is None:
+                logger.warning(
+                    "Process %s finished but adapter lacks pending queue for busy session %s; dispatching immediately",
+                    session_id,
+                    session_key,
+                )
+                await adapter.handle_message(event)
+                return "dispatched"
+
+            self._enqueue_fifo(session_key, event, adapter)
+            logger.info(
+                "Process %s finished — queued internal follow-up behind session backlog %s",
+                session_id,
+                session_key,
+            )
+            return "queued"
+
+        await adapter.handle_message(event)
+        return "dispatched"
+
     async def _inject_watch_notification(self, synth_text: str, evt: dict) -> None:
         """Inject a watch-pattern notification as a synthetic message event.
 
@@ -8927,14 +9035,20 @@ class GatewayRunner:
                                 source=source,
                                 internal=True,
                             )
-                            logger.info(
-                                "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
-                                session_id,
-                                session_key,
-                                source.chat_id,
-                                source.thread_id,
+                            delivery = await self._dispatch_internal_process_event(
+                                adapter=adapter,
+                                session_id=session_id,
+                                session_key=session_key,
+                                event=synth_event,
                             )
-                            await adapter.handle_message(synth_event)
+                            if delivery == "dispatched":
+                                logger.info(
+                                    "Process %s finished — injecting agent notification for session %s chat=%s thread=%s",
+                                    session_id,
+                                    session_key,
+                                    source.chat_id,
+                                    source.thread_id,
+                                )
                         except Exception as e:
                             logger.error("Agent notify injection error: %s", e)
                     break

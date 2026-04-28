@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from gateway.config import GatewayConfig, Platform
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner, _parse_session_key
 
 
@@ -26,11 +27,15 @@ class _FakeRegistry:
 
     def __init__(self, sessions):
         self._sessions = list(sessions)
+        self._completion_consumed = set()
 
     def get(self, session_id):
         if self._sessions:
             return self._sessions.pop(0)
         return None
+
+    def is_completion_consumed(self, session_id):
+        return session_id in self._completion_consumed
 
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
@@ -199,6 +204,137 @@ async def test_run_process_watcher_respects_notification_mode(
     if expected_fragment is not None:
         sent_message = adapter.send.await_args.args[1]
         assert expected_fragment in sent_message
+
+
+@pytest.mark.asyncio
+async def test_drain_process_watcher_registrations_starts_pending_watchers(
+    monkeypatch, tmp_path
+):
+    import tools.process_registry as pr_module
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._process_watcher_tasks = {}
+
+    started = []
+
+    async def _fake_run_process_watcher(watcher):
+        started.append(watcher["session_id"])
+
+    class _FakeRegistry:
+        def drain_pending_watchers(self):
+            return [
+                _watcher_dict(session_id="proc_one"),
+                _watcher_dict(session_id="proc_two"),
+            ]
+
+    monkeypatch.setattr(runner, "_run_process_watcher", _fake_run_process_watcher)
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry())
+
+    count = runner._drain_process_watcher_registrations(recovered=True)
+    await asyncio.sleep(0)
+
+    assert count == 2
+    assert started == ["proc_one", "proc_two"]
+
+
+@pytest.mark.asyncio
+async def test_notify_on_complete_queues_behind_active_session(monkeypatch, tmp_path):
+    import tools.process_registry as pr_module
+
+    sessions = [
+        SimpleNamespace(output_buffer="done\n", exited=True, exit_code=0, command="echo test"),
+    ]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._queued_events = {}
+
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:dm:123"
+    adapter._active_sessions = {session_key: asyncio.Event()}
+    adapter._pending_messages = {}
+
+    watcher = _watcher_dict(session_id="proc_busy")
+    watcher.update({
+        "session_key": session_key,
+        "notify_on_complete": True,
+    })
+
+    await runner._run_process_watcher(watcher)
+
+    adapter.handle_message.assert_not_awaited()
+    assert session_key in adapter._pending_messages
+    queued_event = adapter._pending_messages[session_key]
+    assert queued_event.internal is True
+    assert "Background process proc_busy completed" in queued_event.text
+    assert runner._queued_events == {}
+
+
+@pytest.mark.asyncio
+async def test_notify_on_complete_preserves_fifo_order_with_later_queue(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._queued_events = {}
+
+    adapter = runner.adapters[Platform.TELEGRAM]
+    session_key = "agent:main:telegram:dm:123"
+    adapter._active_sessions = {session_key: asyncio.Event()}
+    adapter._pending_messages = {}
+
+    source = runner._build_process_event_source({"session_key": session_key})
+    internal_event = MessageEvent(
+        text="[IMPORTANT: Background process proc_busy completed]",
+        message_type=MessageType.TEXT,
+        source=source,
+        internal=True,
+    )
+
+    delivery = await runner._dispatch_internal_process_event(
+        adapter=adapter,
+        session_id="proc_busy",
+        session_key=session_key,
+        event=internal_event,
+    )
+
+    later_queue_event = MessageEvent(
+        text="later prompt",
+        message_type=MessageType.TEXT,
+        source=source,
+    )
+    runner._enqueue_fifo(session_key, later_queue_event, adapter)
+
+    assert delivery == "queued"
+    assert adapter._pending_messages[session_key] is internal_event
+    assert runner._queued_events[session_key] == [later_queue_event]
+
+    first_up = adapter._pending_messages.pop(session_key)
+    next_up = runner._promote_queued_event(session_key, adapter, None)
+
+    assert first_up is internal_event
+    assert next_up is later_queue_event
+
+
+def test_drain_process_watcher_registrations_registry_errors_are_best_effort(
+    monkeypatch, tmp_path, caplog
+):
+    import tools.process_registry as pr_module
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+
+    class _BrokenRegistry:
+        def drain_pending_watchers(self):
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(pr_module, "process_registry", _BrokenRegistry())
+
+    count = runner._drain_process_watcher_registrations()
+
+    assert count == 0
+    assert "Process watcher registry drain error: boom" in caplog.text
 
 
 @pytest.mark.asyncio

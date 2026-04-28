@@ -1759,6 +1759,45 @@ class BasePlatformAdapter(ABC):
                     pass
             self._typing_paused.discard(chat_id)
 
+    async def _idle_typing_waiter(self) -> None:
+        """Lightweight stand-in for platforms without typing support.
+
+        The message-processing cleanup path expects an awaitable task it can
+        cancel while keeping the session guard live across the handoff to a
+        queued follow-up. Unsupported platforms do not need real typing IO, but
+        they still benefit from the same cleanup sequencing.
+        """
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            pass
+
+    def _supports_typing_indicator(self) -> bool:
+        """Return True when this adapter actually implements typing updates."""
+        adapter_type = type(self)
+        return (
+            adapter_type.send_typing is not BasePlatformAdapter.send_typing
+            or adapter_type.stop_typing is not BasePlatformAdapter.stop_typing
+        )
+
+    async def _stop_typing_task(
+        self,
+        typing_task: asyncio.Task,
+        *,
+        stop_event: asyncio.Event | None = None,
+        timeout: float = 0.5,
+    ) -> None:
+        """Best-effort shutdown for the per-message typing task."""
+        if stop_event is not None:
+            stop_event.set()
+        typing_task.cancel()
+        try:
+            await asyncio.wait_for(typing_task, timeout=timeout)
+        except asyncio.CancelledError:
+            pass
+        except asyncio.TimeoutError:
+            logger.debug("[%s] typing task did not stop within %.2fs", self.name, timeout)
+
     def pause_typing_for_chat(self, chat_id: str) -> None:
         """Pause typing indicator for a chat (e.g. during approval waits).
 
@@ -2334,12 +2373,11 @@ class BasePlatformAdapter(ABC):
             _keep_typing_sig = None
         if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
             _keep_typing_kwargs["stop_event"] = interrupt_event
-        typing_task = asyncio.create_task(
-            self._keep_typing(
-                event.source.chat_id,
-                **_keep_typing_kwargs,
-            )
-        )
+        typing_coro = self._keep_typing(
+            event.source.chat_id,
+            **_keep_typing_kwargs,
+        ) if self._supports_typing_indicator() else self._idle_typing_waiter()
+        typing_task = asyncio.create_task(typing_coro)
         
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -2562,11 +2600,7 @@ class BasePlatformAdapter(ABC):
                 _active = self._active_sessions.get(session_key)
                 if _active is not None:
                     _active.clear()
-                typing_task.cancel()
-                try:
-                    await typing_task
-                except asyncio.CancelledError:
-                    pass
+                await self._stop_typing_task(typing_task, stop_event=interrupt_event)
                 # Process pending message in new background task
                 await self._process_message_background(pending_event, session_key)
                 return  # Already cleaned up
@@ -2614,11 +2648,7 @@ class BasePlatformAdapter(ABC):
                 except Exception:
                     pass
             # Stop typing indicator
-            typing_task.cancel()
-            try:
-                await typing_task
-            except asyncio.CancelledError:
-                pass
+            await self._stop_typing_task(typing_task, stop_event=interrupt_event)
             # Also cancel any platform-level persistent typing tasks (e.g. Discord)
             # that may have been recreated by _keep_typing after the last stop_typing()
             try:
