@@ -371,6 +371,52 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_retries_transient_transport_failure(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+        sleeps = []
+
+        class _MessageAPI:
+            def update(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    raise BrokenPipeError("broken pipe")
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct),
+            patch("gateway.platforms.feishu.asyncio.sleep", side_effect=lambda delay: sleeps.append(delay)),
+        ):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_progress",
+                    content="retry this update",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_progress")
+        self.assertEqual(len(captured["calls"]), 2)
+        self.assertEqual(captured["calls"][0].message_id, "om_progress")
+        self.assertEqual(captured["calls"][1].message_id, "om_progress")
+        self.assertEqual(sleeps, [1])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from http.client import RemoteDisconnected
 import hmac
 import itertools
 import json
@@ -72,6 +73,11 @@ from typing import Any, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+try:
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+except ImportError:
+    RequestsConnectionError = None  # type: ignore[assignment]
 
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
@@ -228,6 +234,12 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+
+_FEISHU_TRANSIENT_UPDATE_EXCEPTIONS = tuple(
+    exc_type
+    for exc_type in (BrokenPipeError, ConnectionResetError, RemoteDisconnected, RequestsConnectionError)
+    if exc_type is not None
+)
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
@@ -1713,7 +1725,7 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+            response = await self._feishu_edit_with_retry(message_id=message_id, request=request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
@@ -1722,7 +1734,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                fallback_response = await self._feishu_edit_with_retry(message_id=message_id, request=fallback_request)
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
@@ -4149,6 +4161,29 @@ class FeishuAdapter(BasePlatformAdapter):
                 )
                 await asyncio.sleep(wait_seconds)
         raise last_error or RuntimeError("Feishu send failed")
+
+    async def _feishu_edit_with_retry(self, *, message_id: str, request: Any) -> Any:
+        last_error: Optional[Exception] = None
+        for attempt in range(_FEISHU_SEND_ATTEMPTS):
+            try:
+                return await asyncio.to_thread(self._client.im.v1.message.update, request)
+            except Exception as exc:
+                last_error = exc
+                if not isinstance(exc, _FEISHU_TRANSIENT_UPDATE_EXCEPTIONS):
+                    raise
+                if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                    raise
+                wait_seconds = 2 ** attempt
+                logger.warning(
+                    "[Feishu] Edit attempt %d/%d failed for message %s; retrying in %ds: %s",
+                    attempt + 1,
+                    _FEISHU_SEND_ATTEMPTS,
+                    message_id,
+                    wait_seconds,
+                    exc,
+                )
+                await asyncio.sleep(wait_seconds)
+        raise last_error or RuntimeError("Feishu edit failed")
 
     async def _release_app_lock(self) -> None:
         if not self._app_lock_identity:
