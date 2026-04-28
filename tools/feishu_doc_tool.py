@@ -6,6 +6,7 @@ Uses the same lazy-import + BaseRequest pattern as feishu_comment.py.
 
 import json
 import logging
+import os
 import threading
 
 from tools.registry import registry, tool_error, tool_result
@@ -24,6 +25,36 @@ def set_client(client):
 def get_client():
     """Return the lark client for the current thread, or None."""
     return getattr(_local, "client", None)
+
+
+def _build_fallback_client():
+    """Build a generic Feishu/Lark client from env when not in comment context."""
+    app_id = os.getenv("FEISHU_APP_ID", "").strip()
+    app_secret = os.getenv("FEISHU_APP_SECRET", "").strip()
+    domain_name = os.getenv("FEISHU_DOMAIN", "feishu").strip().lower() or "feishu"
+
+    if not app_id or not app_secret:
+        return None, "Feishu client not available (not in a Feishu comment context and FEISHU_APP_ID/FEISHU_APP_SECRET are missing)"
+
+    try:
+        import lark_oapi as lark
+    except ImportError:
+        return None, "lark_oapi not installed"
+
+    domain = getattr(lark, "DOMAIN_FEISHU", None)
+    if domain_name == "lark":
+        domain = getattr(lark, "DOMAIN_LARK", domain)
+
+    builder = (
+        lark.Client.builder()
+        .app_id(app_id)
+        .app_secret(app_secret)
+    )
+    if domain is not None:
+        builder = builder.domain(domain)
+    if hasattr(lark, "LogLevel") and hasattr(lark.LogLevel, "WARNING"):
+        builder = builder.log_level(lark.LogLevel.WARNING)
+    return builder.build(), None
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +97,9 @@ def _handle_feishu_doc_read(args: dict, **kwargs) -> str:
 
     client = get_client()
     if client is None:
-        return tool_error("Feishu client not available (not in a Feishu comment context)")
+        client, error = _build_fallback_client()
+        if client is None:
+            return tool_error(error or "Feishu client not available")
 
     try:
         from lark_oapi import AccessTokenType

@@ -1,7 +1,9 @@
 """Tests for feishu_doc_tool and feishu_drive_tool — registration and schema validation."""
 
 import importlib
+import json
 import unittest
+from unittest.mock import MagicMock, patch
 
 from tools.registry import registry
 
@@ -56,6 +58,92 @@ class TestFeishuToolRegistration(unittest.TestCase):
             props = entry.schema["parameters"].get("properties", {})
             self.assertIn("file_token", props, f"{tool_name} missing file_token param")
             self.assertIn("file_type", props, f"{tool_name} missing file_type param")
+
+
+class TestFeishuDocReadFallback(unittest.TestCase):
+    def test_doc_read_uses_fallback_client_outside_comment_context(self):
+        from tools import feishu_doc_tool
+
+        mock_response = MagicMock()
+        mock_response.code = 0
+        mock_response.raw = MagicMock()
+        mock_response.raw.content = json.dumps({"data": {"content": "hello from doc"}})
+
+        mock_client = MagicMock()
+        mock_client.request.return_value = mock_response
+
+        mock_builder = MagicMock()
+        (
+            mock_builder.app_id.return_value
+            .app_secret.return_value
+            .domain.return_value
+            .log_level.return_value
+            .build.return_value
+        ) = mock_client
+
+        fake_lark = MagicMock()
+        fake_lark.Client.builder.return_value = mock_builder
+        fake_lark.LogLevel.WARNING = "warning"
+
+        with patch.object(feishu_doc_tool, "get_client", return_value=None), \
+             patch.dict(
+                 "os.environ",
+                 {
+                     "FEISHU_APP_ID": "cli_test",
+                     "FEISHU_APP_SECRET": "secret_test",
+                     "FEISHU_DOMAIN": "lark",
+                 },
+                 clear=False,
+             ), \
+             patch.dict(
+                 "sys.modules",
+                 {
+                     "lark_oapi": fake_lark,
+                     "lark_oapi.core.enum": MagicMock(HttpMethod=MagicMock(GET="GET")),
+                     "lark_oapi.core.model.base_request": MagicMock(
+                         BaseRequest=MagicMock(
+                             builder=MagicMock(return_value=MagicMock(
+                                 http_method=MagicMock(return_value=MagicMock(
+                                     uri=MagicMock(return_value=MagicMock(
+                                         token_types=MagicMock(return_value=MagicMock(
+                                             paths=MagicMock(return_value=MagicMock(
+                                                 build=MagicMock(return_value=object())
+                                             ))
+                                         ))
+                                     ))
+                                 ))
+                             ))
+                         )
+                     ),
+                 },
+                 clear=False,
+             ):
+            result = feishu_doc_tool._handle_feishu_doc_read({"doc_token": "doc_123"})
+
+        payload = json.loads(result)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["content"], "hello from doc")
+        mock_client.request.assert_called_once()
+        fake_lark.Client.builder.assert_called_once()
+
+    def test_doc_read_returns_clear_error_when_no_context_and_no_credentials(self):
+        from tools import feishu_doc_tool
+
+        with patch.object(feishu_doc_tool, "get_client", return_value=None), \
+             patch.dict(
+                 "os.environ",
+                 {
+                     "FEISHU_APP_ID": "",
+                     "FEISHU_APP_SECRET": "",
+                     "FEISHU_DOMAIN": "",
+                 },
+                 clear=False,
+             ):
+            result = feishu_doc_tool._handle_feishu_doc_read({"doc_token": "doc_123"})
+
+        payload = json.loads(result)
+        self.assertIn("error", payload)
+        self.assertIn("Feishu client not available", payload["error"])
 
 
 if __name__ == "__main__":
