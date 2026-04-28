@@ -337,9 +337,8 @@ def _patch_callback_card_types(monkeypatch):
 class TestCardActionCallbackResponse:
     """Test that _on_card_action_trigger returns updated card inline."""
 
-    def test_non_admin_rejected_for_approval_action(self, _patch_callback_card_types):
+    def test_approval_action_schedules_resolution(self, _patch_callback_card_types):
         adapter = _make_adapter()
-        adapter._admins = {"admin_open_id"}
         adapter._approval_state[1] = {
             "session_key": "agent:main:feishu:group:oc_12345",
             "message_id": "msg_001",
@@ -349,33 +348,6 @@ class TestCardActionCallbackResponse:
         event = _make_card_action_data(
             {"hermes_action": "approve_once", "approval_id": 1},
             open_id="random_user",
-        ).event
-
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
-            response = adapter._handle_approval_card_action(
-                event=event,
-                action_value=event.action.value,
-                loop=loop,
-            )
-
-        assert response is not None
-        assert response.card is not None
-        assert "Only bot admins can approve this action" in response.card.data
-        assert 1 in adapter._approval_state
-        mock_submit.assert_not_called()
-
-    def test_admin_approval_action_schedules_resolution(self, _patch_callback_card_types):
-        adapter = _make_adapter()
-        adapter._admins = {"admin_open_id"}
-        adapter._approval_state[1] = {
-            "session_key": "agent:main:feishu:group:oc_12345",
-            "message_id": "msg_001",
-            "chat_id": "oc_12345",
-        }
-        loop = MagicMock()
-        event = _make_card_action_data(
-            {"hermes_action": "approve_once", "approval_id": 1},
-            open_id="admin_open_id",
         ).event
         captured = {}
 
@@ -395,40 +367,6 @@ class TestCardActionCallbackResponse:
         assert response.card is not None
         assert response.card.data["header"]["template"] == "green"
         assert "Approved once" in response.card.data["header"]["title"]["content"]
-        assert captured == {"loop": loop, "qualname": "_resolve_approval"}
-        assert 1 in adapter._approval_state
-        mock_submit.assert_called_once()
-
-    def test_empty_admins_remains_backwards_compatible(self, _patch_callback_card_types):
-        adapter = _make_adapter()
-        adapter._admins = set()
-        adapter._approval_state[1] = {
-            "session_key": "agent:main:feishu:group:oc_12345",
-            "message_id": "msg_001",
-            "chat_id": "oc_12345",
-        }
-        loop = MagicMock()
-        event = _make_card_action_data(
-            {"hermes_action": "approve_once", "approval_id": 1},
-            open_id="random_user",
-        ).event
-        captured = {}
-
-        def _capture_submit(submit_loop, coro):
-            captured["loop"] = submit_loop
-            captured["qualname"] = coro.cr_code.co_name
-            coro.close()
-
-        with patch.object(adapter, "_submit_on_loop", side_effect=_capture_submit) as mock_submit:
-            response = adapter._handle_approval_card_action(
-                event=event,
-                action_value=event.action.value,
-                loop=loop,
-            )
-
-        assert response is not None
-        assert response.card is not None
-        assert response.card.data["header"]["template"] == "green"
         assert captured == {"loop": loop, "qualname": "_resolve_approval"}
         assert 1 in adapter._approval_state
         mock_submit.assert_called_once()

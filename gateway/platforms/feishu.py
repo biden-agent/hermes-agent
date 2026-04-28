@@ -2363,23 +2363,6 @@ class FeishuAdapter(BasePlatformAdapter):
         open_id = str(getattr(operator, "open_id", "") or "")
         user_name = self._get_cached_sender_name(open_id) or open_id
 
-        if self._admins and open_id not in self._admins:
-            if P2CardActionTriggerResponse is None:
-                return None
-            response = P2CardActionTriggerResponse()
-            if CallBackCard is not None:
-                card = CallBackCard()
-                card.type = "raw"
-                card.data = json.dumps(
-                    {
-                        "config": {"wide_screen_mode": True},
-                        "elements": [{"tag": "markdown", "content": "Only bot admins can approve this action."}],
-                    },
-                    ensure_ascii=False,
-                )
-                response.card = card
-            return response
-
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
         if P2CardActionTriggerResponse is None:
