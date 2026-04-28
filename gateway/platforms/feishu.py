@@ -64,7 +64,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -202,6 +202,8 @@ _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
 _DEFAULT_MEDIA_BATCH_DELAY_SECONDS = 0.8
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
+_FEISHU_GROUP_HISTORY_SIZE = 100
+_DEFAULT_FEISHU_GROUP_HISTORY_INJECT_COUNT = 5
 _DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _DEFAULT_WEBHOOK_PORT = 8765
 _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
@@ -388,6 +390,7 @@ class FeishuAdapterSettings:
     bot_user_id: str
     bot_name: str
     dedup_cache_size: int
+    group_history_inject_count: int
     text_batch_delay_seconds: float
     text_batch_split_delay_seconds: float
     text_batch_max_messages: int
@@ -420,6 +423,17 @@ class FeishuBatchState:
     events: Dict[str, MessageEvent] = field(default_factory=dict)
     tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FeishuGroupMessageCacheEntry:
+    message_id: str
+    chat_id: str
+    text: str
+    sender_name: Optional[str]
+    user_id: Optional[str]
+    open_id: Optional[str]
+    union_id: Optional[str]
 
 
 # ---------------------------------------------------------------------------
@@ -1368,6 +1382,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sent_message_ids_to_chat: Dict[str, str] = {}  # message_id → chat_id (for reaction routing)
         self._sent_message_id_order: List[str] = []  # LRU order for _sent_message_ids_to_chat
         self._chat_info_cache: Dict[str, Dict[str, Any]] = {}
+        self._group_message_history: Dict[str, deque[FeishuGroupMessageCacheEntry]] = {}
         self._message_text_cache: Dict[str, Optional[str]] = {}
         self._app_lock_identity: Optional[str] = None
         self._text_batch_state = FeishuBatchState()
@@ -1407,6 +1422,16 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
+        group_history_inject_count = _coerce_required_int(
+            extra.get("group_history_inject_count")
+            if extra.get("group_history_inject_count") is not None
+            else os.getenv(
+                "HERMES_FEISHU_GROUP_HISTORY_INJECT_COUNT",
+                str(_DEFAULT_FEISHU_GROUP_HISTORY_INJECT_COUNT),
+            ),
+            default=_DEFAULT_FEISHU_GROUP_HISTORY_INJECT_COUNT,
+            min_value=0,
+        )
 
         return FeishuAdapterSettings(
             app_id=str(extra.get("app_id") or os.getenv("FEISHU_APP_ID", "")).strip(),
@@ -1430,6 +1455,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 32,
                 int(os.getenv("HERMES_FEISHU_DEDUP_CACHE_SIZE", str(_DEFAULT_DEDUP_CACHE_SIZE))),
             ),
+            group_history_inject_count=group_history_inject_count,
             text_batch_delay_seconds=float(
                 os.getenv("HERMES_FEISHU_TEXT_BATCH_DELAY_SECONDS", str(_DEFAULT_TEXT_BATCH_DELAY_SECONDS))
             ),
@@ -1484,6 +1510,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._bot_user_id = settings.bot_user_id
         self._bot_name = settings.bot_name
         self._dedup_cache_size = settings.dedup_cache_size
+        self._group_history_inject_count = settings.group_history_inject_count
         self._text_batch_delay_seconds = settings.text_batch_delay_seconds
         self._text_batch_split_delay_seconds = settings.text_batch_split_delay_seconds
         self._text_batch_max_messages = settings.text_batch_max_messages
@@ -2205,6 +2232,73 @@ class FeishuAdapter(BasePlatformAdapter):
             with self._pending_inbound_lock:
                 self._pending_drain_scheduled = False
 
+    @staticmethod
+    def _coerce_group_history_text(*, text: str, media_urls: Sequence[str], inbound_type: MessageType) -> str:
+        rendered = (text or "").strip()
+        if rendered:
+            return rendered
+        if media_urls:
+            return {
+                MessageType.PHOTO: FALLBACK_IMAGE_TEXT,
+                MessageType.VIDEO: "[Video]",
+                MessageType.DOCUMENT: FALLBACK_ATTACHMENT_TEXT,
+                MessageType.AUDIO: "[Audio]",
+                MessageType.VOICE: "[Voice message]",
+            }.get(inbound_type, FALLBACK_ATTACHMENT_TEXT)
+        return ""
+
+    @staticmethod
+    def _group_history_sender_label(entry: FeishuGroupMessageCacheEntry) -> str:
+        return entry.sender_name or entry.user_id or entry.open_id or entry.union_id or "unknown"
+
+    def _append_group_message_history(self, entry: FeishuGroupMessageCacheEntry) -> None:
+        history_map = getattr(self, "_group_message_history", None)
+        if history_map is None:
+            history_map = {}
+            self._group_message_history = history_map
+        history = history_map.get(entry.chat_id)
+        if history is None:
+            history = deque(maxlen=_FEISHU_GROUP_HISTORY_SIZE)
+            history_map[entry.chat_id] = history
+        history.append(entry)
+
+    def _build_group_history_context(self, *, chat_id: str, before_message_id: str) -> str:
+        history = getattr(self, "_group_message_history", {}).get(chat_id)
+        if not history:
+            return ""
+        prior = [entry for entry in history if entry.message_id != before_message_id]
+        if not prior:
+            return ""
+        if self._group_history_inject_count <= 0:
+            return ""
+        lines = ["[Previous group messages]"]
+        for idx, entry in enumerate(prior[-self._group_history_inject_count:], start=1):
+            lines.append(f"{idx}. {self._group_history_sender_label(entry)}: {entry.text}")
+        return "\n".join(lines)
+
+    async def _cache_group_message(
+        self,
+        *,
+        message: Any,
+        sender_id: Any,
+        message_id: str,
+    ) -> tuple[str, MessageType, List[str], List[str], List[FeishuMentionRef], Dict[str, Optional[str]]]:
+        text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
+        if inbound_type == MessageType.TEXT:
+            text = _strip_edge_self_mentions(text, mentions)
+        sender_profile = await self._resolve_sender_profile(sender_id)
+        entry = FeishuGroupMessageCacheEntry(
+            message_id=message_id,
+            chat_id=str(getattr(message, "chat_id", "") or ""),
+            text=self._coerce_group_history_text(text=text, media_urls=media_urls, inbound_type=inbound_type),
+            sender_name=sender_profile.get("user_name"),
+            user_id=sender_profile.get("user_id"),
+            open_id=getattr(sender_id, "open_id", None) or None,
+            union_id=getattr(sender_id, "union_id", None) or None,
+        )
+        self._append_group_message_history(entry)
+        return text, inbound_type, media_urls, media_types, mentions, sender_profile
+
     async def _handle_message_event_data(self, data: Any) -> None:
         """Shared inbound message handling for websocket and webhook transports."""
         event = getattr(data, "event", None)
@@ -2222,9 +2316,18 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._is_self_sent_bot_message(event):
             logger.debug("[Feishu] Dropping self-sent bot event: %s", message_id)
             return
-
+        
         chat_type = getattr(message, "chat_type", "p2p")
         chat_id = getattr(message, "chat_id", "") or ""
+        extracted_content = None
+        sender_profile = None
+        if chat_type != "p2p":
+            extracted_content = await self._cache_group_message(
+                message=message,
+                sender_id=sender_id,
+                message_id=message_id,
+            )
+            sender_profile = extracted_content[-1]
         if chat_type != "p2p" and not self._should_accept_group_message(message, sender_id, chat_id):
             logger.debug("[Feishu] Dropping group message that failed mention/policy gate: %s", message_id)
             return
@@ -2234,6 +2337,8 @@ class FeishuAdapter(BasePlatformAdapter):
             sender_id=sender_id,
             chat_type=chat_type,
             message_id=message_id,
+            extracted_content=extracted_content,
+            sender_profile=sender_profile,
         )
 
     def _on_message_read_event(self, data: P2ImMessageMessageReadV1) -> None:
@@ -2700,8 +2805,15 @@ class FeishuAdapter(BasePlatformAdapter):
         sender_id: Any,
         chat_type: str,
         message_id: str,
+        extracted_content: Optional[tuple[str, MessageType, List[str], List[str], List[FeishuMentionRef], Dict[str, Optional[str]]]] = None,
+        sender_profile: Optional[Dict[str, Optional[str]]] = None,
     ) -> None:
-        text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
+        if extracted_content is None:
+            text, inbound_type, media_urls, media_types, mentions = await self._extract_message_content(message)
+        else:
+            text, inbound_type, media_urls, media_types, mentions, cached_sender_profile = extracted_content
+            if sender_profile is None:
+                sender_profile = cached_sender_profile
 
         if inbound_type == MessageType.TEXT:
             text = _strip_edge_self_mentions(text, mentions)
@@ -2717,6 +2829,13 @@ class FeishuAdapter(BasePlatformAdapter):
             hint = _build_mention_hint(mentions)
             if hint:
                 text = f"{hint}\n\n{text}" if text else hint
+
+        chat_id = getattr(message, "chat_id", "") or ""
+        history_context = ""
+        if chat_type != "p2p" and inbound_type != MessageType.COMMAND:
+            history_context = self._build_group_history_context(chat_id=chat_id, before_message_id=message_id)
+            if history_context:
+                text = f"{history_context}\n\n{text}" if text else history_context
 
         reply_to_message_id = (
             getattr(message, "parent_id", None)
@@ -2735,9 +2854,9 @@ class FeishuAdapter(BasePlatformAdapter):
             len(media_urls),
         )
 
-        chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
-        sender_profile = await self._resolve_sender_profile(sender_id)
+        if sender_profile is None:
+            sender_profile = await self._resolve_sender_profile(sender_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
@@ -2759,6 +2878,8 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             timestamp=datetime.now(),
         )
+        if history_context:
+            normalized._feishu_group_history_signature = f"{message_id}:{text}"  # type: ignore[attr-defined]
         await self._dispatch_inbound_event(normalized)
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
@@ -3077,6 +3198,8 @@ class FeishuAdapter(BasePlatformAdapter):
             existing.reply_to_message_id == incoming.reply_to_message_id
             and existing.reply_to_text == incoming.reply_to_text
             and existing.source.thread_id == incoming.source.thread_id
+            and getattr(existing, "_feishu_group_history_signature", None)
+            == getattr(incoming, "_feishu_group_history_signature", None)
         )
 
     async def _enqueue_text_event(self, event: MessageEvent) -> None:

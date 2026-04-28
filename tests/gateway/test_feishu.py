@@ -495,6 +495,20 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         self.assertEqual(info["type"], "group")
 
 class TestAdapterModule(unittest.TestCase):
+    @patch.dict(os.environ, {"HERMES_FEISHU_GROUP_HISTORY_INJECT_COUNT": "4"}, clear=True)
+    def test_load_settings_accepts_group_history_inject_count_from_extra(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        settings = FeishuAdapter._load_settings(
+            {
+                "group_history_inject_count": 3,
+            }
+        )
+        env_settings = FeishuAdapter._load_settings({})
+
+        self.assertEqual(settings.group_history_inject_count, 3)
+        self.assertEqual(env_settings.group_history_inject_count, 4)
+
     def test_load_settings_uses_sdk_defaults_for_invalid_ws_reconnect_values(self):
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -1140,6 +1154,236 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertFalse(adapter2._should_accept_group_message(SimpleNamespace(mentions=[same_name_other_id_mention]), sender_id, ""))
         self.assertTrue(adapter2._should_accept_group_message(SimpleNamespace(mentions=[bot_mention]), sender_id, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_unmentioned_group_message_is_cached_before_mention_gate_drop(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={
+                "user_id": "u_alice",
+                "user_name": "Alice",
+                "user_id_alt": "on_alice",
+            }
+        )
+
+        message = SimpleNamespace(
+            message_id="om_group_1",
+            chat_type="group",
+            chat_id="oc_group",
+            message_type="text",
+            content='{"text":"first cached line"}',
+            mentions=[],
+        )
+        sender_id = SimpleNamespace(open_id="ou_alice", user_id="u_alice", union_id="on_alice")
+        data = SimpleNamespace(event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id)))
+
+        with patch.object(adapter, "_should_accept_group_message", return_value=False):
+            asyncio.run(adapter._handle_message_event_data(data))
+
+        adapter._dispatch_inbound_event.assert_not_awaited()
+        cached = list(adapter._group_message_history["oc_group"])
+        self.assertEqual(len(cached), 1)
+        self.assertEqual(cached[0].message_id, "om_group_1")
+        self.assertEqual(cached[0].text, "first cached line")
+        self.assertEqual(cached[0].sender_name, "Alice")
+        self.assertEqual(cached[0].user_id, "u_alice")
+        self.assertEqual(cached[0].open_id, "ou_alice")
+        self.assertEqual(cached[0].union_id, "on_alice")
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_group_mention_injects_configured_number_of_cached_messages(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"group_history_inject_count": 3}))
+        adapter._bot_open_id = "ou_bot"
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Platform Team", "type": "group"}
+        )
+
+        profiles = {
+            "ou_alice": {"user_id": "u_alice", "user_name": "Alice", "user_id_alt": "on_alice"},
+            "ou_bob": {"user_id": "u_bob", "user_name": "Bob", "user_id_alt": "on_bob"},
+            "ou_charlie": {"user_id": "u_charlie", "user_name": None, "user_id_alt": None},
+            "ou_dana": {"user_id": "u_dana", "user_name": "Dana", "user_id_alt": "on_dana"},
+            "ou_evan": {"user_id": "u_evan", "user_name": "Evan", "user_id_alt": "on_evan"},
+            "ou_faith": {"user_id": "u_faith", "user_name": "Faith", "user_id_alt": "on_faith"},
+        }
+
+        async def _resolve(sender_id):
+            return profiles[sender_id.open_id]
+
+        adapter._resolve_sender_profile = AsyncMock(side_effect=_resolve)
+
+        def _event(*, sender_open_id, message_id, content, mentions):
+            message = SimpleNamespace(
+                message_id=message_id,
+                chat_type="group",
+                chat_id="oc_group",
+                thread_id=None,
+                parent_id=None,
+                upper_message_id=None,
+                message_type="text",
+                content=content,
+                mentions=mentions,
+            )
+            sender_id = SimpleNamespace(
+                open_id=sender_open_id,
+                user_id=profiles[sender_open_id]["user_id"],
+                union_id=profiles[sender_open_id]["user_id_alt"],
+            )
+            return SimpleNamespace(
+                event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id))
+            )
+
+        unmentioned = [
+            _event(sender_open_id="ou_alice", message_id="om_1", content='{"text":"first line"}', mentions=[]),
+            _event(sender_open_id="ou_bob", message_id="om_2", content='{"text":"second line"}', mentions=[]),
+            _event(sender_open_id="ou_charlie", message_id="om_3", content='{"text":"third line"}', mentions=[]),
+            _event(sender_open_id="ou_evan", message_id="om_4", content='{"text":"fourth line"}', mentions=[]),
+            _event(sender_open_id="ou_faith", message_id="om_5", content='{"text":"fifth line"}', mentions=[]),
+        ]
+        mentioned = _event(
+            sender_open_id="ou_dana",
+            message_id="om_6",
+            content='{"text":"@_user_1 please help with deploy"}',
+            mentions=[
+                SimpleNamespace(
+                    key="@_user_1",
+                    name="Hermes",
+                    id=SimpleNamespace(open_id="ou_bot", user_id="u_bot"),
+                )
+            ],
+        )
+
+        async def _run() -> None:
+            for payload in unmentioned:
+                await adapter._handle_message_event_data(payload)
+            await adapter._handle_message_event_data(mentioned)
+
+        asyncio.run(_run())
+
+        adapter._dispatch_inbound_event.assert_awaited_once()
+        self.assertEqual(adapter._resolve_sender_profile.await_count, 6)
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(
+            event.text,
+            "[Previous group messages]\n"
+            "1. u_charlie: third line\n"
+            "2. Evan: fourth line\n"
+            "3. Faith: fifth line\n\n"
+            "please help with deploy",
+        )
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_group_mention_history_does_not_merge_into_stale_text_batch(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_open_id = "ou_bot"
+        adapter.handle_message = AsyncMock()
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Platform Team", "type": "group"}
+        )
+
+        profiles = {
+            "ou_a": {"user_id": "u_a", "user_name": "Alice", "user_id_alt": None},
+            "ou_b": {"user_id": "u_b", "user_name": "Bob", "user_id_alt": None},
+            "ou_c": {"user_id": "u_c", "user_name": "Carol", "user_id_alt": None},
+            "ou_d": {"user_id": "u_d", "user_name": "Dana", "user_id_alt": None},
+            "ou_e": {"user_id": "u_e", "user_name": "Evan", "user_id_alt": None},
+            "ou_f": {"user_id": "u_f", "user_name": "Faith", "user_id_alt": None},
+            "ou_g": {"user_id": "u_g", "user_name": "Grace", "user_id_alt": None},
+        }
+
+        async def _resolve(sender_id):
+            return profiles[sender_id.open_id]
+
+        adapter._resolve_sender_profile = AsyncMock(side_effect=_resolve)
+
+        def _payload(*, sender_open_id, message_id, text, mention_bot=False):
+            mentions = []
+            raw_text = text
+            if mention_bot:
+                raw_text = f"@_user_1 {text}"
+                mentions = [
+                    SimpleNamespace(
+                        key="@_user_1",
+                        name="Hermes",
+                        id=SimpleNamespace(open_id="ou_bot", user_id="u_bot"),
+                    )
+                ]
+            message = SimpleNamespace(
+                message_id=message_id,
+                chat_type="group",
+                chat_id="oc_group",
+                thread_id=None,
+                parent_id=None,
+                upper_message_id=None,
+                message_type="text",
+                content=json.dumps({"text": raw_text}, ensure_ascii=False),
+                mentions=mentions,
+            )
+            sender_id = SimpleNamespace(
+                open_id=sender_open_id,
+                user_id=profiles[sender_open_id]["user_id"],
+                union_id=None,
+            )
+            return SimpleNamespace(
+                event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id))
+            )
+
+        async def _sleep(_delay):
+            return None
+
+        async def _run() -> None:
+            with patch("gateway.platforms.feishu.asyncio.sleep", side_effect=_sleep):
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_a", message_id="om_1", text="one"))
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_b", message_id="om_2", text="two"))
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_c", message_id="om_3", text="three"))
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_f", message_id="om_4", text="four"))
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_g", message_id="om_5", text="five"))
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_d", message_id="om_6", text="first ask", mention_bot=True))
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_a", message_id="om_7", text="six"))
+                await adapter._handle_message_event_data(_payload(sender_open_id="ou_e", message_id="om_8", text="second ask", mention_bot=True))
+                pending = list(adapter._pending_text_batch_tasks.values())
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run(_run())
+
+        self.assertEqual(adapter.handle_message.await_count, 2)
+        first = adapter.handle_message.await_args_list[0].args[0]
+        second = adapter.handle_message.await_args_list[1].args[0]
+        self.assertEqual(
+            first.text,
+            "[Previous group messages]\n"
+            "1. Alice: one\n"
+            "2. Bob: two\n"
+            "3. Carol: three\n"
+            "4. Faith: four\n"
+            "5. Grace: five\n\n"
+            "first ask",
+        )
+        self.assertEqual(
+            second.text,
+            "[Previous group messages]\n"
+            "1. Carol: three\n"
+            "2. Faith: four\n"
+            "3. Grace: five\n"
+            "4. Dana: first ask\n"
+            "5. Alice: six\n\n"
+            "second ask",
+        )
 
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_post_message_as_text(self):
