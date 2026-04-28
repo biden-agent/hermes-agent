@@ -3438,7 +3438,281 @@ class GatewayRunner:
             return "ignore"
 
         return "pair"
-    
+
+    def _get_platform_command_permissions(self, platform: Optional[Platform]) -> Optional[Dict[str, Any]]:
+        """Return the platform's command-permission config when enabled."""
+        if platform is None:
+            return None
+        config = getattr(self, "config", None)
+        if not config or not hasattr(config, "platforms"):
+            return None
+        platform_cfg = config.platforms.get(platform)
+        extra = getattr(platform_cfg, "extra", None)
+        if not isinstance(extra, dict):
+            return None
+        permissions = extra.get("command_permissions")
+        if not isinstance(permissions, dict):
+            return None
+        if "enabled" in permissions and not is_truthy_value(permissions.get("enabled"), default=True):
+            return None
+        return permissions
+
+    @staticmethod
+    def _get_platform_extra_from_user_config(
+        user_config: Dict[str, Any],
+        platform: Optional[Platform],
+    ) -> Dict[str, Any]:
+        """Return ``platforms.<platform>.extra`` from config.yaml when present."""
+        if platform is None or not isinstance(user_config, dict):
+            return {}
+        platforms_cfg = user_config.get("platforms")
+        if not isinstance(platforms_cfg, dict):
+            return {}
+        platform_cfg = platforms_cfg.get(platform.value)
+        if not isinstance(platform_cfg, dict):
+            return {}
+        extra = platform_cfg.get("extra")
+        return extra if isinstance(extra, dict) else {}
+
+    @staticmethod
+    def _normalize_identity_values(values: Any) -> set[str]:
+        """Coerce config/user identity values into a stripped string set."""
+        if values is None:
+            return set()
+        if isinstance(values, str):
+            iterable = values.split(",")
+        elif isinstance(values, (list, tuple, set, frozenset)):
+            iterable = values
+        else:
+            iterable = [values]
+        normalized = set()
+        for value in iterable:
+            text = str(value or "").strip()
+            if text:
+                normalized.add(text)
+        return normalized
+
+    @staticmethod
+    def _normalize_string_values(values: Any, *, lowercase: bool = False) -> set[str]:
+        """Normalize scalar or list config values into a string set."""
+        if values is None:
+            return set()
+        if isinstance(values, str):
+            iterable = values.split(",")
+        elif isinstance(values, (list, tuple, set, frozenset)):
+            iterable = values
+        else:
+            iterable = [values]
+        normalized = set()
+        for value in iterable:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            normalized.add(text.lower() if lowercase else text)
+        return normalized
+
+    @staticmethod
+    def _normalize_allowed_command_values(values: Any) -> tuple[set[str], list[str]]:
+        """Normalize allowed command names for matching and user-facing display."""
+        if values is None:
+            iterable = []
+        elif isinstance(values, str):
+            iterable = [values]
+        elif isinstance(values, (list, tuple, set, frozenset)):
+            iterable = list(values)
+        else:
+            iterable = [values]
+
+        try:
+            from hermes_cli.commands import resolve_command as _resolve_allowed_command
+        except Exception:
+            _resolve_allowed_command = None
+
+        allowed: set[str] = set()
+        display: list[str] = []
+        for value in iterable:
+            normalized = str(value or "").strip().lstrip("/").lower()
+            if not normalized:
+                continue
+            display.append("*" if normalized == "*" else f"/{normalized}")
+            allowed.add(normalized)
+            if _resolve_allowed_command is None:
+                continue
+            try:
+                cmd_def = _resolve_allowed_command(normalized)
+            except Exception:
+                cmd_def = None
+            if cmd_def:
+                allowed.add(cmd_def.name)
+        return allowed, display
+
+    @staticmethod
+    def _collect_source_sender_ids(source: Any) -> set[str]:
+        """Collect sender IDs available on ``SessionSource``."""
+        if source is None:
+            return set()
+        return GatewayRunner._normalize_identity_values(
+            [getattr(source, "user_id", None), getattr(source, "user_id_alt", None)]
+        )
+
+    @staticmethod
+    def _collect_event_sender_ids(event: MessageEvent) -> set[str]:
+        """Collect all known sender IDs, including Feishu raw-event IDs."""
+        ids = set()
+        source = getattr(event, "source", None)
+        if source is not None:
+            ids.update(GatewayRunner._collect_source_sender_ids(source))
+
+        if not source or getattr(source, "platform", None) != Platform.FEISHU:
+            return ids
+
+        def _get_field(obj: Any, key: str) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        def _add_ids(obj: Any) -> None:
+            if obj is None:
+                return
+            for key in ("open_id", "user_id", "union_id"):
+                value = _get_field(obj, key)
+                text = str(value or "").strip()
+                if text:
+                    ids.add(text)
+
+        raw_message = getattr(event, "raw_message", None)
+        raw_event = _get_field(raw_message, "event")
+        _add_ids(_get_field(_get_field(raw_event, "sender"), "sender_id"))
+        _add_ids(_get_field(raw_event, "user_id"))
+        _add_ids(_get_field(raw_event, "operator"))
+        return ids
+
+    def _resolve_effective_enabled_toolsets(
+        self,
+        *,
+        user_config: Dict[str, Any],
+        source: SessionSource,
+        actor_ids: Optional[set[str]] = None,
+    ) -> list[str]:
+        """Return the toolset scope this sender may use for agent turns."""
+        from hermes_cli.tools_config import _get_platform_tools
+
+        platform = getattr(source, "platform", None)
+        platform_key = _platform_config_key(platform)
+        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+        extra = self._get_platform_extra_from_user_config(user_config, platform)
+        permissions = extra.get("tool_permissions")
+        if not isinstance(permissions, dict):
+            return enabled_toolsets
+        if "enabled" in permissions and not is_truthy_value(permissions.get("enabled"), default=True):
+            return enabled_toolsets
+
+        admin_values = permissions.get("admins")
+        if admin_values is None:
+            admin_values = extra.get("admins", [])
+        admin_ids = self._normalize_identity_values(admin_values)
+        effective_actor_ids = set(actor_ids or ()) or self._collect_source_sender_ids(source)
+        if admin_ids and effective_actor_ids and (admin_ids & effective_actor_ids):
+            return enabled_toolsets
+
+        allowed_toolsets = self._normalize_string_values(
+            permissions.get("allowed_toolsets"),
+            lowercase=True,
+        )
+        if allowed_toolsets:
+            enabled_toolsets = [
+                toolset for toolset in enabled_toolsets if toolset.lower() in allowed_toolsets
+            ]
+
+        disabled_toolsets = self._normalize_string_values(
+            permissions.get("disabled_toolsets"),
+            lowercase=True,
+        )
+        if disabled_toolsets:
+            enabled_toolsets = [
+                toolset for toolset in enabled_toolsets if toolset.lower() not in disabled_toolsets
+            ]
+
+        return enabled_toolsets
+
+    @staticmethod
+    def _format_command_permission_denial(
+        *,
+        command_name: Optional[str],
+        allowed_commands: list[str],
+        free_text: bool,
+    ) -> str:
+        allowed_suffix = ""
+        if allowed_commands:
+            preview = ", ".join(allowed_commands[:12])
+            if len(allowed_commands) > 12:
+                preview += ", ..."
+            allowed_suffix = f" Allowed commands: {preview}."
+        if free_text:
+            return f"Only bot admins can send free-form prompts here.{allowed_suffix}"
+        return f"You don't have permission to use `/{command_name}` here.{allowed_suffix}"
+
+    def _check_command_permissions(
+        self,
+        event: MessageEvent,
+        *,
+        raw_command: Optional[str],
+        canonical_command: Optional[str],
+    ) -> Optional[str]:
+        """Return a denial message when the platform restricts this sender."""
+        if bool(getattr(event, "internal", False)):
+            return None
+        source = getattr(event, "source", None)
+        platform = getattr(source, "platform", None)
+        permissions = self._get_platform_command_permissions(platform)
+        if not permissions:
+            return None
+
+        config = getattr(self, "config", None)
+        platform_cfg = config.platforms.get(platform) if config and hasattr(config, "platforms") else None
+        extra = getattr(platform_cfg, "extra", None)
+        extra = extra if isinstance(extra, dict) else {}
+
+        admin_values = permissions.get("admins")
+        if admin_values is None:
+            admin_values = extra.get("admins", [])
+        admin_ids = self._normalize_identity_values(admin_values)
+        sender_ids = self._collect_event_sender_ids(event)
+        if admin_ids and sender_ids and (admin_ids & sender_ids):
+            return None
+
+        allowed_commands, display_commands = self._normalize_allowed_command_values(
+            permissions.get("allowed_commands", [])
+        )
+        allow_plain_text = is_truthy_value(
+            permissions.get("allow_plain_text"),
+            default=False,
+        )
+
+        if raw_command:
+            candidates = {raw_command.lower()}
+            if canonical_command:
+                candidates.add(canonical_command.lower())
+            if "*" in allowed_commands or candidates & allowed_commands:
+                return None
+            return self._format_command_permission_denial(
+                command_name=raw_command,
+                allowed_commands=display_commands,
+                free_text=False,
+            )
+
+        if allow_plain_text:
+            return None
+
+        return self._format_command_permission_denial(
+            command_name=None,
+            allowed_commands=display_commands,
+            free_text=True,
+        )
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -3614,6 +3888,24 @@ class GatewayRunner:
                         e,
                     )
                 _update_prompts.pop(_quick_key, None)
+
+        from hermes_cli.commands import (
+            GATEWAY_KNOWN_COMMANDS,
+            is_gateway_known_command,
+            resolve_command as _resolve_cmd,
+        )
+
+        command = event.get_command()
+        _cmd_def = _resolve_cmd(command) if command else None
+        canonical = _cmd_def.name if _cmd_def else command
+
+        permission_denial = self._check_command_permissions(
+            event,
+            raw_command=command,
+            canonical_command=canonical,
+        )
+        if permission_denial:
+            return permission_denial
 
         # PRIORITY handling when an agent is already running for this session.
         # Default behavior is to interrupt immediately so user text/stop messages
@@ -3948,19 +4240,8 @@ class GatewayRunner:
                 self._pending_messages[_quick_key] = event.text
             return None
 
-        # Check for commands
-        command = event.get_command()
-
-        from hermes_cli.commands import (
-            GATEWAY_KNOWN_COMMANDS,
-            is_gateway_known_command,
-            resolve_command as _resolve_cmd,
-        )
-
-        # Resolve aliases to canonical name so dispatch and hook names
-        # don't depend on the exact alias the user typed.
-        _cmd_def = _resolve_cmd(command) if command else None
-        canonical = _cmd_def.name if _cmd_def else command
+        # Check for commands. ``command``/``canonical`` were resolved above so
+        # restricted users are blocked before any running-agent or hook path.
 
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
@@ -5015,6 +5296,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
+                actor_ids=self._collect_event_sender_ids(event),
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -7014,10 +7296,11 @@ class GatewayRunner:
 
         source = event.source
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        actor_ids = self._collect_event_sender_ids(event)
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(
-            self._run_background_task(prompt, source, task_id)
+            self._run_background_task(prompt, source, task_id, actor_ids=actor_ids)
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
@@ -7026,7 +7309,12 @@ class GatewayRunner:
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        *,
+        actor_ids: Optional[set[str]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -7053,9 +7341,11 @@ class GatewayRunner:
                 return
 
             platform_key = _platform_config_key(source.platform)
-
-            from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = self._resolve_effective_enabled_toolsets(
+                user_config=user_config,
+                source=source,
+                actor_ids=actor_ids,
+            )
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -9814,6 +10104,7 @@ class GatewayRunner:
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None,
+        actor_ids: Optional[set[str]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -9850,9 +10141,11 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
-
-        from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = self._resolve_effective_enabled_toolsets(
+            user_config=user_config,
+            source=source,
+            actor_ids=actor_ids,
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -11430,6 +11723,11 @@ class GatewayRunner:
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    actor_ids=(
+                        self._collect_event_sender_ids(pending_event)
+                        if pending_event is not None
+                        else actor_ids
+                    ),
                 )
         finally:
             # Stop progress sender, interrupt monitor, and notification task

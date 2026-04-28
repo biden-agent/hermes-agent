@@ -238,6 +238,56 @@ class TestLoadGatewayConfig:
 
         assert config.thread_sessions_per_user is True
 
+    def test_platform_extra_preserves_feishu_command_permissions(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  feishu:\n"
+            "    extra:\n"
+            "      command_permissions:\n"
+            "        allowed_commands:\n"
+            "          - status\n"
+            "          - help\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.FEISHU].extra["command_permissions"]["allowed_commands"] == [
+            "status",
+            "help",
+        ]
+
+    def test_platform_extra_preserves_feishu_tool_permissions(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  feishu:\n"
+            "    extra:\n"
+            "      tool_permissions:\n"
+            "        allowed_toolsets:\n"
+            "          - web\n"
+            "          - memory\n"
+            "        disabled_toolsets:\n"
+            "          - terminal\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.FEISHU].extra["tool_permissions"] == {
+            "allowed_toolsets": ["web", "memory"],
+            "disabled_toolsets": ["terminal"],
+        }
+
     def test_thread_sessions_per_user_defaults_to_false(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()
