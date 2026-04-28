@@ -1,5 +1,7 @@
 """Regression tests for sudo detection and sudo password handling."""
 
+import json
+
 import tools.terminal_tool as terminal_tool
 
 
@@ -103,3 +105,66 @@ def test_validate_workdir_blocks_shell_metacharacters_in_windows_paths():
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project; rm -rf /")
     assert terminal_tool._validate_workdir(r"C:\Users\Alice\project$(whoami)")
     assert terminal_tool._validate_workdir("C:\\Users\\Alice\\project\nwhoami")
+
+
+def test_background_gateway_run_guidance_detects_manual_gateway_run():
+    msg = terminal_tool._background_gateway_run_guidance(
+        "cd /Users/dev/.hermes/hermes-agent && source venv/bin/activate && python -m hermes_cli.main gateway run --replace 2>&1"
+    )
+
+    assert msg is not None
+    assert "dual instances" in msg
+
+
+def test_background_gateway_run_guidance_detects_bash_lc_wrapper():
+    msg = terminal_tool._background_gateway_run_guidance(
+        'bash -lc "cd /Users/dev/.hermes/hermes-agent && python -m hermes_cli.main gateway run --replace"'
+    )
+
+    assert msg is not None
+    assert "dual instances" in msg
+
+
+def test_background_gateway_run_guidance_detects_zsh_lc_wrapper():
+    msg = terminal_tool._background_gateway_run_guidance(
+        'zsh -lc "hermes gateway run --replace"'
+    )
+
+    assert msg is not None
+    assert "dual instances" in msg
+
+
+def test_background_gateway_run_guidance_ignores_search_text():
+    msg = terminal_tool._background_gateway_run_guidance(
+        'rg "hermes gateway run" README.md'
+    )
+
+    assert msg is None
+
+
+def test_terminal_tool_blocks_background_gateway_run(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: {"env_type": "local", "cwd": "/tmp", "timeout": 30},
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_start_cleanup_thread",
+        lambda: (_ for _ in ()).throw(AssertionError("cleanup thread should not start")),
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(
+            command="python -m hermes_cli.main gateway run --replace",
+            background=True,
+        )
+    )
+
+    assert result["status"] == "blocked"
+    assert "dual instances" in result["error"]

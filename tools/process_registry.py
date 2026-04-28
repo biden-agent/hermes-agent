@@ -157,6 +157,7 @@ class ProcessRegistry:
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
+        self._watchers_lock = threading.Lock()
 
         # Notification queue — unified queue for all background process events.
         # Completion notifications (notify_on_complete) and watch pattern matches
@@ -177,6 +178,20 @@ class ProcessRegistry:
         self._global_watch_window_hits: int = 0
         self._global_watch_tripped_until: float = 0.0
         self._global_watch_suppressed_during_trip: int = 0
+
+    def enqueue_pending_watcher(self, watcher: Dict[str, Any]) -> None:
+        """Register a gateway watcher request in a thread-safe way."""
+        with self._watchers_lock:
+            self.pending_watchers.append(dict(watcher))
+
+    def drain_pending_watchers(self) -> List[Dict[str, Any]]:
+        """Return and clear all queued watcher registrations atomically."""
+        with self._watchers_lock:
+            if not self.pending_watchers:
+                return []
+            watchers = list(self.pending_watchers)
+            self.pending_watchers.clear()
+        return watchers
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -1245,7 +1260,7 @@ class ProcessRegistry:
 
                 # Re-enqueue watcher so gateway can resume notifications
                 if session.watcher_interval > 0:
-                    self.pending_watchers.append({
+                    self.enqueue_pending_watcher({
                         "session_id": session.id,
                         "check_interval": session.watcher_interval,
                         "session_key": session.session_key,

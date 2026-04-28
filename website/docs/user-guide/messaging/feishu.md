@@ -438,6 +438,58 @@ platforms:
 
 Groups not listed in `group_rules` fall back to `default_group_policy` (defaults to the value of `FEISHU_GROUP_POLICY`).
 
+## Per-User Permissions
+
+If you want Feishu admins to keep full agent access while regular members can only run a narrow command set, add `command_permissions` under `platforms.feishu.extra`:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      admins:
+        - "ou_admin_open_id"
+      command_permissions:
+        allowed_commands:
+          - help
+          - status
+          - commands
+          - usage
+        allow_plain_text: false
+```
+
+- Users in `admins` bypass these restrictions and can use any slash command or free-form prompt.
+- Other Feishu users may only run the commands listed in `allowed_commands`.
+- `allow_plain_text: false` blocks regular users from sending arbitrary prompts to the full agent. Set it to `true` if you still want free-text chats for non-admins.
+- Command matching accepts either the canonical slash command (`status`) or an alias the user types (`reset`, `reload_mcp`, custom quick-command names, skill command names, etc.).
+
+If plain-text prompts are allowed, you can separately restrict which toolsets non-admin users get inside the agent:
+
+```yaml
+platforms:
+  feishu:
+    extra:
+      admins:
+        - "ou_admin_open_id"
+      command_permissions:
+        allowed_commands:
+          - help
+          - status
+        allow_plain_text: true
+      tool_permissions:
+        allowed_toolsets:
+          - web
+          - memory
+        disabled_toolsets:
+          - terminal
+          - file
+```
+
+- `tool_permissions` only affects non-admin users; `admins` still keep the platform's full default toolset preset.
+- `allowed_toolsets` is an allowlist intersected with the normal `hermes-feishu` preset.
+- `disabled_toolsets` subtracts risky toolsets from non-admin access.
+- If both are set, Hermes first applies `allowed_toolsets`, then removes anything listed in `disabled_toolsets`.
+- For Feishu, admin matching accepts any sender ID Hermes sees for that user (`open_id`, `user_id`, or `union_id` when available), so you can keep using the same `admins` list as the group ACL examples above.
+
 ## Deduplication
 
 Inbound messages are deduplicated using message IDs with a 24-hour TTL. The dedup state is persisted across restarts to `~/.hermes/feishu_seen_message_ids.json`.

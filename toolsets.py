@@ -232,6 +232,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "feishu_bitable": {
+        "description": "Read Feishu/Lark bitable records",
+        "tools": ["feishu_bitable_read"],
+        "includes": []
+    },
+
     "feishu_drive": {
         "description": "Feishu/Lark document comment operations (list, reply, add)",
         "tools": [

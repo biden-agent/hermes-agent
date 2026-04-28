@@ -51,6 +51,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "qwen-oauth",
     "xiaomi",
     "arcee",
+    "gmi",
     "custom", "local",
     # Common aliases
     "google", "google-gemini", "google-ai-studio",
@@ -60,6 +61,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "stepfun", "opencode", "zen", "go", "vercel", "kilo", "dashscope", "aliyun", "qwen",
     "mimo", "xiaomi-mimo",
     "arcee-ai", "arceeai",
+    "gmi-cloud", "gmicloud",
     "xai", "x-ai", "x.ai", "grok",
     "nvidia", "nim", "nvidia-nim", "nemotron",
     "qwen-portal",
@@ -104,6 +106,7 @@ _MODEL_CACHE_TTL = 3600
 _endpoint_model_metadata_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _endpoint_model_metadata_cache_time: Dict[str, float] = {}
 _ENDPOINT_MODEL_CACHE_TTL = 300
+_ENDPOINT_PROBE_FAILURE_CACHE_TTL = 300
 
 # Descending tiers for context length probing when the model is unknown.
 # We start at 256K (covers GPT-5.x, many current large-context models) and
@@ -307,6 +310,7 @@ _URL_TO_PROVIDER: Dict[str, str] = {
     "integrate.api.nvidia.com": "nvidia",
     "api.xiaomimimo.com": "xiaomi",
     "xiaomimimo.com": "xiaomi",
+    "api.gmi-serving.com": "gmi",
     "ollama.com": "ollama-cloud",
 }
 
@@ -570,6 +574,22 @@ def fetch_endpoint_model_metadata(
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
 
+    use_persistent_failure_cache = (
+        _is_custom_endpoint(normalized)
+        and not _is_known_provider_base_url(normalized)
+        and not is_local_endpoint(normalized)
+    )
+
+    if use_persistent_failure_cache and not force_refresh:
+        failed_at = _get_recent_endpoint_probe_failure(normalized)
+        if failed_at is not None:
+            logger.debug(
+                "Skipping %s/models probe due to recent cached failure at %s",
+                normalized,
+                failed_at,
+            )
+            return {}
+
     if not force_refresh:
         cached = _endpoint_model_metadata_cache.get(normalized)
         cached_at = _endpoint_model_metadata_cache_time.get(normalized, 0)
@@ -637,6 +657,8 @@ def fetch_endpoint_model_metadata(
 
                 _endpoint_model_metadata_cache[normalized] = cache
                 _endpoint_model_metadata_cache_time[normalized] = time.time()
+                if use_persistent_failure_cache:
+                    _clear_endpoint_probe_failure(normalized)
                 return cache
         except Exception as exc:
             last_error = exc
@@ -691,21 +713,117 @@ def fetch_endpoint_model_metadata(
 
             _endpoint_model_metadata_cache[normalized] = cache
             _endpoint_model_metadata_cache_time[normalized] = time.time()
+            if use_persistent_failure_cache:
+                _clear_endpoint_probe_failure(normalized)
             return cache
         except Exception as exc:
             last_error = exc
 
     if last_error:
         logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
+    if use_persistent_failure_cache:
+        _record_endpoint_probe_failure(normalized)
     _endpoint_model_metadata_cache[normalized] = {}
     _endpoint_model_metadata_cache_time[normalized] = time.time()
     return {}
+
+
+def _resolve_endpoint_context_length(
+    model: str,
+    base_url: str,
+    api_key: str = "",
+) -> Optional[int]:
+    """Resolve context length from an endpoint's live ``/models`` metadata."""
+    endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
+    matched = endpoint_metadata.get(model)
+    if not matched:
+        if len(endpoint_metadata) == 1:
+            matched = next(iter(endpoint_metadata.values()))
+        else:
+            for key, entry in endpoint_metadata.items():
+                if model in key or key in model:
+                    matched = entry
+                    break
+    if matched:
+        context_length = matched.get("context_length")
+        if isinstance(context_length, int):
+            return context_length
+    return None
 
 
 def _get_context_cache_path() -> Path:
     """Return path to the persistent context length cache file."""
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "context_length_cache.yaml"
+
+
+def _get_endpoint_probe_failure_cache_path() -> Path:
+    """Return path to the persistent failed-endpoint probe cache file."""
+    from hermes_constants import get_hermes_home
+    return get_hermes_home() / "endpoint_model_probe_failures.yaml"
+
+
+def _load_endpoint_probe_failure_cache() -> Dict[str, float]:
+    """Load recently failed custom-endpoint metadata probes from disk."""
+    path = _get_endpoint_probe_failure_cache_path()
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+        failures = data.get("failed_probes", {})
+        if not isinstance(failures, dict):
+            return {}
+        cache: Dict[str, float] = {}
+        for key, value in failures.items():
+            try:
+                cache[str(key)] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return cache
+    except Exception as e:
+        logger.debug("Failed to load endpoint probe failure cache: %s", e)
+        return {}
+
+
+def _save_endpoint_probe_failure_cache(failures: Dict[str, float]) -> None:
+    """Persist recently failed custom-endpoint metadata probes to disk."""
+    path = _get_endpoint_probe_failure_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            yaml.dump({"failed_probes": failures}, f, default_flow_style=False)
+    except Exception as e:
+        logger.debug("Failed to save endpoint probe failure cache: %s", e)
+
+
+def _get_recent_endpoint_probe_failure(base_url: str) -> Optional[float]:
+    """Return a recent failed-probe timestamp if the TTL has not expired."""
+    failures = _load_endpoint_probe_failure_cache()
+    failed_at = failures.get(base_url)
+    if failed_at is None:
+        return None
+    if (time.time() - failed_at) < _ENDPOINT_PROBE_FAILURE_CACHE_TTL:
+        return failed_at
+    failures.pop(base_url, None)
+    _save_endpoint_probe_failure_cache(failures)
+    return None
+
+
+def _record_endpoint_probe_failure(base_url: str) -> None:
+    """Record a failed custom-endpoint metadata probe with a short TTL."""
+    failures = _load_endpoint_probe_failure_cache()
+    failures[base_url] = time.time()
+    _save_endpoint_probe_failure_cache(failures)
+
+
+def _clear_endpoint_probe_failure(base_url: str) -> None:
+    """Clear a persisted failed-probe entry after a successful retry."""
+    failures = _load_endpoint_probe_failure_cache()
+    if base_url not in failures:
+        return
+    failures.pop(base_url, None)
+    _save_endpoint_probe_failure_cache(failures)
 
 
 def _load_context_cache() -> Dict[str, int]:
@@ -1295,22 +1413,9 @@ def get_model_context_length(
     # returns 128k) instead of the model's full context (400k).  models.dev
     # has the correct per-provider values and is checked at step 5+.
     if _is_custom_endpoint(base_url) and not _is_known_provider_base_url(base_url):
-        endpoint_metadata = fetch_endpoint_model_metadata(base_url, api_key=api_key)
-        matched = endpoint_metadata.get(model)
-        if not matched:
-            # Single-model servers: if only one model is loaded, use it
-            if len(endpoint_metadata) == 1:
-                matched = next(iter(endpoint_metadata.values()))
-            else:
-                # Fuzzy match: substring in either direction
-                for key, entry in endpoint_metadata.items():
-                    if model in key or key in model:
-                        matched = entry
-                        break
-        if matched:
-            context_length = matched.get("context_length")
-            if isinstance(context_length, int):
-                return context_length
+        context_length = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        if context_length is not None:
+            return context_length
         if not _is_known_provider_base_url(base_url):
             # 3. Try querying local server directly
             if is_local_endpoint(base_url):
@@ -1374,6 +1479,12 @@ def get_model_context_length(
             if base_url:
                 save_context_length(model, base_url, codex_ctx)
             return codex_ctx
+    if effective_provider == "gmi" and base_url:
+        # GMI exposes authoritative context_length via /models, but it is not
+        # in models.dev yet. Preserve that higher-fidelity endpoint lookup.
+        ctx = _resolve_endpoint_context_length(model, base_url, api_key=api_key)
+        if ctx is not None:
+            return ctx
     if effective_provider:
         from agent.models_dev import lookup_models_dev_context
         ctx = lookup_models_dev_context(effective_provider, model)

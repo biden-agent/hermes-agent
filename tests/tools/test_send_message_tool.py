@@ -13,6 +13,7 @@ from tools.send_message_tool import (
     _derive_forum_thread_name,
     _parse_target_ref,
     _send_discord,
+    _send_feishu,
     _send_matrix_via_adapter,
     _send_telegram,
     _send_to_platform,
@@ -533,6 +534,33 @@ class TestSendToPlatformChunking:
         assert result["success"] is True
         helper.assert_not_awaited()
         lightweight.assert_awaited_once()
+
+
+class TestSendFeishu:
+    def test_thread_target_is_sent_as_thread_reply(self):
+        adapter = MagicMock()
+        adapter._domain_name = "feishu"
+        adapter._build_lark_client.return_value = object()
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="om_thread_reply"))
+
+        with patch("gateway.platforms.feishu.FEISHU_AVAILABLE", True), \
+             patch("gateway.platforms.feishu.FeishuAdapter", return_value=adapter):
+            result = asyncio.run(
+                _send_feishu(
+                    SimpleNamespace(enabled=True, token="bot-token", extra={"app_id": "cli_a", "app_secret": "cli_s"}),
+                    "oc_chat",
+                    "hello from thread target",
+                    thread_id="om_thread_root",
+                )
+            )
+
+        assert result["success"] is True
+        adapter.send.assert_awaited_once_with(
+            "oc_chat",
+            "hello from thread target",
+            reply_to="om_thread_root",
+            metadata={"thread_id": "om_thread_root"},
+        )
 
     def test_send_matrix_via_adapter_sends_document(self, tmp_path):
         file_path = tmp_path / "report.pdf"

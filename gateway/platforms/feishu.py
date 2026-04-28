@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from http.client import RemoteDisconnected
 import hmac
 import itertools
 import json
@@ -56,6 +57,10 @@ import logging
 import mimetypes
 import os
 import re
+import shlex
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -68,6 +73,11 @@ from typing import Any, Dict, List, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+try:
+    from requests.exceptions import ConnectionError as RequestsConnectionError
+except ImportError:
+    RequestsConnectionError = None  # type: ignore[assignment]
 
 # aiohttp/websockets are independent optional deps — import outside lark_oapi
 # so they remain available for tests and webhook mode even if lark_oapi is missing.
@@ -224,6 +234,12 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
 }
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
+
+_FEISHU_TRANSIENT_UPDATE_EXCEPTIONS = tuple(
+    exc_type
+    for exc_type in (BrokenPipeError, ConnectionResetError, RemoteDisconnected, RequestsConnectionError)
+    if exc_type is not None
+)
 
 # Feishu reactions render as prominent badges, unlike Discord/Telegram's
 # small footer emoji — a success badge on every message would add noise, so
@@ -1709,7 +1725,7 @@ class FeishuAdapter(BasePlatformAdapter):
             msg_type, payload = self._build_outbound_payload(content)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
-            response = await asyncio.to_thread(self._client.im.v1.message.update, request)
+            response = await self._feishu_edit_with_retry(message_id=message_id, request=request)
             result = self._finalize_send_result(response, "update failed")
             if not result.success and msg_type == "post" and _POST_CONTENT_INVALID_RE.search(result.error or ""):
                 logger.warning("[Feishu] Invalid post update payload rejected by API; falling back to plain text")
@@ -1718,7 +1734,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     content=json.dumps({"text": _strip_markdown_to_plain_text(content)}, ensure_ascii=False),
                 )
                 fallback_request = self._build_update_message_request(message_id=message_id, request_body=fallback_body)
-                fallback_response = await asyncio.to_thread(self._client.im.v1.message.update, fallback_request)
+                fallback_response = await self._feishu_edit_with_retry(message_id=message_id, request=fallback_request)
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
@@ -1825,7 +1841,7 @@ class FeishuAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
         **kwargs,
     ) -> SendResult:
-        """Send audio to Feishu as a file attachment plus optional caption."""
+        """Send audio to Feishu as a native audio message when possible."""
         return await self._send_uploaded_file_message(
             chat_id=chat_id,
             file_path=audio_path,
@@ -1833,6 +1849,7 @@ class FeishuAdapter(BasePlatformAdapter):
             metadata=metadata,
             caption=caption,
             outbound_message_type="audio",
+            prefer_native_audio=True,
         )
 
     async def send_document(
@@ -2345,23 +2362,6 @@ class FeishuAdapter(BasePlatformAdapter):
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         user_name = self._get_cached_sender_name(open_id) or open_id
-
-        if self._admins and open_id not in self._admins:
-            if P2CardActionTriggerResponse is None:
-                return None
-            response = P2CardActionTriggerResponse()
-            if CallBackCard is not None:
-                card = CallBackCard()
-                card.type = "raw"
-                card.data = json.dumps(
-                    {
-                        "config": {"wide_screen_mode": True},
-                        "elements": [{"tag": "markdown", "content": "Only bot admins can approve this action."}],
-                    },
-                    ensure_ascii=False,
-                )
-                response.card = card
-            return response
 
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
@@ -3867,6 +3867,7 @@ class FeishuAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         file_name: Optional[str] = None,
         outbound_message_type: str = "file",
+        prefer_native_audio: bool = False,
     ) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="Not connected")
@@ -3878,12 +3879,27 @@ class FeishuAdapter(BasePlatformAdapter):
             file_path=display_name,
             requested_message_type=outbound_message_type,
         )
+        upload_path = file_path
+        cleanup_upload = None
+        upload_duration_ms: Optional[int] = None
+        if prefer_native_audio:
+            try:
+                upload_path, upload_duration_ms, cleanup_upload = self._prepare_voice_message_asset(file_path)
+                display_name = os.path.basename(upload_path)
+                upload_file_type, resolved_message_type = self._resolve_outbound_file_routing(
+                    file_path=display_name,
+                    requested_message_type=outbound_message_type,
+                )
+            except Exception as exc:
+                logger.warning("[Feishu] Failed to prepare native audio asset %s: %s", file_path, exc, exc_info=True)
+                return SendResult(success=False, error=str(exc))
         try:
-            with open(file_path, "rb") as file_obj:
+            with open(upload_path, "rb") as file_obj:
                 body = self._build_file_upload_body(
                     file_type=upload_file_type,
                     file_name=display_name,
                     file=file_obj,
+                    duration=upload_duration_ms,
                 )
                 request = self._build_file_upload_request(body)
                 upload_response = await asyncio.to_thread(self._client.im.v1.file.create, request)
@@ -3920,6 +3936,12 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to send file %s: %s", file_path, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+        finally:
+            if cleanup_upload:
+                try:
+                    cleanup_upload()
+                except Exception:
+                    logger.debug("[Feishu] Failed to clean up temporary audio asset %s", upload_path, exc_info=True)
 
     async def _send_raw_message(
         self,
@@ -4123,6 +4145,29 @@ class FeishuAdapter(BasePlatformAdapter):
                 await asyncio.sleep(wait_seconds)
         raise last_error or RuntimeError("Feishu send failed")
 
+    async def _feishu_edit_with_retry(self, *, message_id: str, request: Any) -> Any:
+        last_error: Optional[Exception] = None
+        for attempt in range(_FEISHU_SEND_ATTEMPTS):
+            try:
+                return await asyncio.to_thread(self._client.im.v1.message.update, request)
+            except Exception as exc:
+                last_error = exc
+                if not isinstance(exc, _FEISHU_TRANSIENT_UPDATE_EXCEPTIONS):
+                    raise
+                if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
+                    raise
+                wait_seconds = 2 ** attempt
+                logger.warning(
+                    "[Feishu] Edit attempt %d/%d failed for message %s; retrying in %ds: %s",
+                    attempt + 1,
+                    _FEISHU_SEND_ATTEMPTS,
+                    message_id,
+                    wait_seconds,
+                    exc,
+                )
+                await asyncio.sleep(wait_seconds)
+        raise last_error or RuntimeError("Feishu edit failed")
+
     async def _release_app_lock(self) -> None:
         if not self._app_lock_identity:
             return
@@ -4270,16 +4315,21 @@ class FeishuAdapter(BasePlatformAdapter):
         return SimpleNamespace(request_body=request_body)
 
     @staticmethod
-    def _build_file_upload_body(*, file_type: str, file_name: str, file: Any) -> Any:
+    def _build_file_upload_body(*, file_type: str, file_name: str, file: Any, duration: Optional[int] = None) -> Any:
         if "CreateFileRequestBody" in globals():
-            return (
+            builder = (
                 CreateFileRequestBody.builder()
                 .file_type(file_type)
                 .file_name(file_name)
                 .file(file)
-                .build()
             )
-        return SimpleNamespace(file_type=file_type, file_name=file_name, file=file)
+            if duration is not None:
+                builder = builder.duration(duration)
+            return builder.build()
+        body = SimpleNamespace(file_type=file_type, file_name=file_name, file=file)
+        if duration is not None:
+            body.duration = duration
+        return body
 
     @staticmethod
     def _build_file_upload_request(request_body: Any) -> Any:
@@ -4313,10 +4363,106 @@ class FeishuAdapter(BasePlatformAdapter):
         if ext in _FEISHU_DOC_UPLOAD_TYPES:
             return _FEISHU_DOC_UPLOAD_TYPES[ext], "file"
 
+        if requested_message_type == "audio":
+            return _FEISHU_FILE_UPLOAD_TYPE, "audio"
+
         if requested_message_type == "file":
             return _FEISHU_FILE_UPLOAD_TYPE, "file"
 
         return _FEISHU_FILE_UPLOAD_TYPE, "file"
+
+    @staticmethod
+    def _prepare_voice_message_asset(audio_path: str) -> tuple[str, Optional[int], Optional[callable]]:
+        ext = Path(audio_path).suffix.lower()
+        if ext in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
+            return audio_path, FeishuAdapter._probe_audio_duration_ms_best_effort(audio_path), None
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffmpeg_path:
+            raise RuntimeError("ffmpeg is required to convert audio into Feishu native voice format")
+        if not ffprobe_path:
+            raise RuntimeError("ffprobe is required to measure Feishu voice duration")
+
+        fd, converted_path = tempfile.mkstemp(prefix="feishu-voice-", suffix=".opus")
+        os.close(fd)
+        try:
+            subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-y",
+                    "-i",
+                    audio_path,
+                    "-vn",
+                    "-acodec",
+                    "libopus",
+                    "-b:a",
+                    "32k",
+                    "-ac",
+                    "1",
+                    converted_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    converted_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            duration_text = (probe.stdout or "").strip()
+            duration_ms = max(1, int(round(float(duration_text) * 1000))) if duration_text else None
+        except Exception:
+            if os.path.exists(converted_path):
+                os.unlink(converted_path)
+            raise
+
+        def _cleanup() -> None:
+            if os.path.exists(converted_path):
+                os.unlink(converted_path)
+
+        return converted_path, duration_ms, _cleanup
+
+    @staticmethod
+    def _probe_audio_duration_ms_best_effort(audio_path: str) -> Optional[int]:
+        ffprobe_path = shutil.which("ffprobe")
+        if not ffprobe_path:
+            return None
+
+        try:
+            probe = subprocess.run(
+                [
+                    ffprobe_path,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=1",
+                    audio_path,
+                ],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            duration_text = (probe.stdout or "").strip()
+            return max(1, int(round(float(duration_text) * 1000))) if duration_text else None
+        except Exception:
+            return None
 
 
 # =============================================================================

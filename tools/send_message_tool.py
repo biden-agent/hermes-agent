@@ -556,6 +556,23 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- Feishu: native adapter helper supports text + media ---
+    if platform == Platform.FEISHU and media_files:
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _send_feishu(
+                pconfig,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else [],
+                thread_id=thread_id,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
@@ -1075,6 +1092,7 @@ async def _send_email(extra, chat_id, message):
     """Send via SMTP (one-shot, no persistent connection needed)."""
     import smtplib
     from email.mime.text import MIMEText
+    from email.utils import formatdate
 
     address = extra.get("address") or os.getenv("EMAIL_ADDRESS", "")
     password = os.getenv("EMAIL_PASSWORD", "")
@@ -1092,6 +1110,7 @@ async def _send_email(extra, chat_id, message):
         msg["From"] = address
         msg["To"] = chat_id
         msg["Subject"] = "Hermes Agent"
+        msg["Date"] = formatdate(localtime=True)
 
         server = smtplib.SMTP(smtp_host, smtp_port)
         server.starttls(context=ssl.create_default_context())
@@ -1434,10 +1453,11 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
         domain = FEISHU_DOMAIN if domain_name != "lark" else LARK_DOMAIN
         adapter._client = adapter._build_lark_client(domain)
         metadata = {"thread_id": thread_id} if thread_id else None
+        reply_to = thread_id or None
 
         last_result = None
         if message.strip():
-            last_result = await adapter.send(chat_id, message, metadata=metadata)
+            last_result = await adapter.send(chat_id, message, reply_to=reply_to, metadata=metadata)
             if not last_result.success:
                 return _error(f"Feishu send failed: {last_result.error}")
 
@@ -1447,15 +1467,15 @@ async def _send_feishu(pconfig, chat_id, message, media_files=None, thread_id=No
 
             ext = os.path.splitext(media_path)[1].lower()
             if ext in _IMAGE_EXTS:
-                last_result = await adapter.send_image_file(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_image_file(chat_id, media_path, reply_to=reply_to, metadata=metadata)
             elif ext in _VIDEO_EXTS:
-                last_result = await adapter.send_video(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_video(chat_id, media_path, reply_to=reply_to, metadata=metadata)
             elif ext in _VOICE_EXTS and is_voice:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_voice(chat_id, media_path, reply_to=reply_to, metadata=metadata)
             elif ext in _AUDIO_EXTS:
-                last_result = await adapter.send_voice(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_voice(chat_id, media_path, reply_to=reply_to, metadata=metadata)
             else:
-                last_result = await adapter.send_document(chat_id, media_path, metadata=metadata)
+                last_result = await adapter.send_document(chat_id, media_path, reply_to=reply_to, metadata=metadata)
 
             if not last_result.success:
                 return _error(f"Feishu media send failed: {last_result.error}")

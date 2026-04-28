@@ -371,6 +371,52 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_edit_message_retries_transient_transport_failure(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {"calls": []}
+        sleeps = []
+
+        class _MessageAPI:
+            def update(self, request):
+                captured["calls"].append(request)
+                if len(captured["calls"]) == 1:
+                    raise BrokenPipeError("broken pipe")
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with (
+            patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct),
+            patch("gateway.platforms.feishu.asyncio.sleep", side_effect=lambda delay: sleeps.append(delay)),
+        ):
+            result = asyncio.run(
+                adapter.edit_message(
+                    chat_id="oc_chat",
+                    message_id="om_progress",
+                    content="retry this update",
+                )
+            )
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_progress")
+        self.assertEqual(len(captured["calls"]), 2)
+        self.assertEqual(captured["calls"][0].message_id, "om_progress")
+        self.assertEqual(captured["calls"][1].message_id, "om_progress")
+        self.assertEqual(sleeps, [1])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -2339,6 +2385,137 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(captured["upload_request"].request_body.file_type, "opus")
         self.assertEqual(captured["message_request"].request_body.msg_type, "audio")
         self.assertEqual(captured["message_request"].request_body.content, '{"file_key": "file_audio_123"}')
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_voice_existing_opus_includes_duration_in_upload_request(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _FileAPI:
+            def create(self, request):
+                captured["upload_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(file_key="file_audio_789"),
+                )
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["message_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_audio_msg_3"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    file=_FileAPI(),
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        def _fake_run(command, **kwargs):
+            self.assertEqual(command[0], "/usr/bin/ffprobe")
+            self.assertEqual(command[-1], audio_path)
+            return SimpleNamespace(stdout="4.2\n")
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".opus", delete=False) as tmp:
+            tmp.write(b"opus")
+            audio_path = tmp.name
+
+        try:
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct), \
+                 patch("gateway.platforms.feishu.shutil.which", side_effect=lambda name: "/usr/bin/ffprobe" if name == "ffprobe" else None), \
+                 patch("gateway.platforms.feishu.subprocess.run", side_effect=_fake_run):
+                result = asyncio.run(adapter.send_voice(chat_id="oc_chat", audio_path=audio_path))
+        finally:
+            os.unlink(audio_path)
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["upload_request"].request_body.file_type, "opus")
+        self.assertEqual(captured["upload_request"].request_body.duration, 4200)
+        self.assertEqual(captured["message_request"].request_body.msg_type, "audio")
+        self.assertEqual(captured["message_request"].request_body.content, '{"file_key": "file_audio_789"}')
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_voice_transcodes_mp3_to_opus_for_audio_message(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _FileAPI:
+            def create(self, request):
+                captured["upload_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(file_key="file_audio_456"),
+                )
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["message_request"] = request
+                return SimpleNamespace(
+                    success=lambda: True,
+                    data=SimpleNamespace(message_id="om_audio_msg_2"),
+                )
+
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    file=_FileAPI(),
+                    message=_MessageAPI(),
+                )
+            )
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with tempfile.NamedTemporaryFile("wb", suffix=".mp3", delete=False) as tmp:
+            tmp.write(b"ID3")
+            audio_path = tmp.name
+
+        cleanup_calls = []
+
+        def _fake_prepare(path):
+            self.assertEqual(path, audio_path)
+            converted = f"{audio_path}.opus"
+            Path(converted).write_bytes(b"opus")
+
+            def _cleanup():
+                cleanup_calls.append(converted)
+                if os.path.exists(converted):
+                    os.unlink(converted)
+
+            return converted, 4200, _cleanup
+
+        try:
+            with patch.object(adapter, "_prepare_voice_message_asset", side_effect=_fake_prepare), \
+                 patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send_voice(chat_id="oc_chat", audio_path=audio_path))
+        finally:
+            if os.path.exists(audio_path):
+                os.unlink(audio_path)
+            converted = f"{audio_path}.opus"
+            if os.path.exists(converted):
+                os.unlink(converted)
+
+        self.assertTrue(result.success)
+        self.assertEqual(cleanup_calls, [f"{audio_path}.opus"])
+        self.assertEqual(captured["upload_request"].request_body.file_type, "opus")
+        self.assertEqual(captured["upload_request"].request_body.duration, 4200)
+        self.assertEqual(captured["message_request"].request_body.msg_type, "audio")
+        self.assertEqual(captured["message_request"].request_body.content, '{"file_key": "file_audio_456"}')
 
     @patch.dict(os.environ, {}, clear=True)
     def test_build_post_payload_extracts_title_and_links(self):

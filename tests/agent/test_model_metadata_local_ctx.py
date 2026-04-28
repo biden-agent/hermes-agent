@@ -7,6 +7,7 @@ All tests use synthetic inputs — no filesystem or live server required.
 import sys
 import os
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -484,6 +485,80 @@ class TestFetchEndpointModelMetadataLmStudio:
         }
         assert result["lmstudio-community/Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf"]["context_length"] == 131072
         assert result["Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf"]["context_length"] == 131072
+
+
+class TestFetchEndpointModelMetadataNegativeCache:
+    def test_failed_custom_endpoint_probe_is_persisted_briefly(self, tmp_path):
+        from agent import model_metadata
+
+        cache_path = tmp_path / "endpoint_probe_failures.yaml"
+        with patch("agent.model_metadata._get_endpoint_probe_failure_cache_path", return_value=cache_path), \
+             patch("agent.model_metadata.requests.get", side_effect=Exception("boom")) as mock_get:
+            result = model_metadata.fetch_endpoint_model_metadata(
+                "https://apibest.ai/v1",
+                force_refresh=True,
+            )
+
+        assert result == {}
+        assert mock_get.call_count == 2
+        assert cache_path.exists()
+
+        model_metadata._endpoint_model_metadata_cache.clear()
+        model_metadata._endpoint_model_metadata_cache_time.clear()
+
+        with patch("agent.model_metadata._get_endpoint_probe_failure_cache_path", return_value=cache_path), \
+             patch("agent.model_metadata.requests.get") as mock_get:
+            result = model_metadata.fetch_endpoint_model_metadata("https://apibest.ai/v1")
+
+        assert result == {}
+        mock_get.assert_not_called()
+
+    def test_failed_custom_endpoint_probe_retries_after_ttl(self, tmp_path):
+        from agent import model_metadata
+
+        cache_path = tmp_path / "endpoint_probe_failures.yaml"
+        stale_time = time.time() - (model_metadata._ENDPOINT_PROBE_FAILURE_CACHE_TTL + 1)
+        cache_path.write_text(
+            f"failed_probes:\n  https://apibest.ai/v1: {stale_time}\n",
+            encoding="utf-8",
+        )
+
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"data": [{"id": "foo", "context_length": 65536}]}
+
+        with patch("agent.model_metadata._get_endpoint_probe_failure_cache_path", return_value=cache_path), \
+             patch("agent.model_metadata.requests.get", return_value=resp) as mock_get:
+            result = model_metadata.fetch_endpoint_model_metadata(
+                "https://apibest.ai/v1",
+                force_refresh=True,
+            )
+
+        assert mock_get.call_count >= 1
+        assert result["foo"]["context_length"] == 65536
+
+    def test_successful_probe_clears_persistent_negative_cache(self, tmp_path):
+        from agent import model_metadata
+
+        cache_path = tmp_path / "endpoint_probe_failures.yaml"
+        cache_path.write_text(
+            f"failed_probes:\n  https://apibest.ai/v1: {time.time()}\n",
+            encoding="utf-8",
+        )
+
+        resp = MagicMock()
+        resp.raise_for_status.return_value = None
+        resp.json.return_value = {"data": [{"id": "foo", "context_length": 65536}]}
+
+        with patch("agent.model_metadata._get_endpoint_probe_failure_cache_path", return_value=cache_path), \
+             patch("agent.model_metadata.requests.get", return_value=resp):
+            result = model_metadata.fetch_endpoint_model_metadata(
+                "https://apibest.ai/v1",
+                force_refresh=True,
+            )
+
+        assert result["foo"]["context_length"] == 65536
+        assert "https://apibest.ai/v1" not in cache_path.read_text(encoding="utf-8")
 
 
 class TestQueryLocalContextLengthNetworkError:
