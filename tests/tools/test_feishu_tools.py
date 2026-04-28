@@ -84,6 +84,15 @@ class TestFeishuDocReadFallback(unittest.TestCase):
         fake_lark = MagicMock()
         fake_lark.Client.builder.return_value = mock_builder
         fake_lark.LogLevel.WARNING = "warning"
+        fake_lark.AccessTokenType.TENANT = "tenant"
+
+        request_builder = MagicMock()
+        request_builder.http_method.return_value = request_builder
+        request_builder.uri.return_value = request_builder
+        request_builder.token_types.return_value = request_builder
+        request_builder.paths.return_value = request_builder
+        request_builder.queries.return_value = request_builder
+        request_builder.build.return_value = object()
 
         with patch.object(feishu_doc_tool, "get_client", return_value=None), \
              patch.dict(
@@ -101,19 +110,7 @@ class TestFeishuDocReadFallback(unittest.TestCase):
                      "lark_oapi": fake_lark,
                      "lark_oapi.core.enum": MagicMock(HttpMethod=MagicMock(GET="GET")),
                      "lark_oapi.core.model.base_request": MagicMock(
-                         BaseRequest=MagicMock(
-                             builder=MagicMock(return_value=MagicMock(
-                                 http_method=MagicMock(return_value=MagicMock(
-                                     uri=MagicMock(return_value=MagicMock(
-                                         token_types=MagicMock(return_value=MagicMock(
-                                             paths=MagicMock(return_value=MagicMock(
-                                                 build=MagicMock(return_value=object())
-                                             ))
-                                         ))
-                                     ))
-                                 ))
-                             ))
-                         )
+                         BaseRequest=MagicMock(builder=MagicMock(return_value=request_builder))
                      ),
                  },
                  clear=False,
@@ -125,6 +122,152 @@ class TestFeishuDocReadFallback(unittest.TestCase):
         self.assertEqual(payload["content"], "hello from doc")
         mock_client.request.assert_called_once()
         fake_lark.Client.builder.assert_called_once()
+
+    def test_doc_read_resolves_wiki_token_before_reading_raw_content(self):
+        from tools import feishu_doc_tool
+
+        wiki_response = MagicMock()
+        wiki_response.code = 0
+        wiki_response.raw = MagicMock()
+        wiki_response.raw.content = json.dumps(
+            {"data": {"node": {"obj_type": "docx", "obj_token": "resolved_docx_token"}}}
+        )
+
+        raw_response = MagicMock()
+        raw_response.code = 0
+        raw_response.raw = MagicMock()
+        raw_response.raw.content = json.dumps({"data": {"content": "resolved from wiki"}})
+
+        mock_client = MagicMock()
+        mock_client.request.side_effect = [wiki_response, raw_response]
+
+        request_builder = MagicMock()
+        request_builder.http_method.return_value = request_builder
+        request_builder.uri.return_value = request_builder
+        request_builder.token_types.return_value = request_builder
+        request_builder.paths.return_value = request_builder
+        request_builder.queries.return_value = request_builder
+        request_builder.build.side_effect = ["wiki_request", "raw_request"]
+
+        fake_lark = MagicMock()
+        fake_lark.AccessTokenType.TENANT = "tenant"
+
+        with patch.object(feishu_doc_tool, "get_client", return_value=mock_client), \
+             patch.dict(
+                 "sys.modules",
+                 {
+                     "lark_oapi": fake_lark,
+                     "lark_oapi.core.enum": MagicMock(HttpMethod=MagicMock(GET="GET")),
+                     "lark_oapi.core.model.base_request": MagicMock(
+                         BaseRequest=MagicMock(builder=MagicMock(return_value=request_builder))
+                     ),
+                 },
+                 clear=False,
+             ):
+            result = feishu_doc_tool._handle_feishu_doc_read({"doc_token": "wiki_token_123"})
+
+        payload = json.loads(result)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["content"], "resolved from wiki")
+        self.assertEqual(mock_client.request.call_count, 2)
+
+    def test_doc_read_falls_back_to_wiki_resolution_after_doc_not_found(self):
+        from tools import feishu_doc_tool
+
+        not_found_response = MagicMock()
+        not_found_response.code = 1770002
+        not_found_response.msg = "not found"
+
+        wiki_response = MagicMock()
+        wiki_response.code = 0
+        wiki_response.raw = MagicMock()
+        wiki_response.raw.content = json.dumps(
+            {"data": {"node": {"obj_type": "docx", "obj_token": "resolved_docx_token"}}}
+        )
+
+        raw_response = MagicMock()
+        raw_response.code = 0
+        raw_response.raw = MagicMock()
+        raw_response.raw.content = json.dumps({"data": {"content": "resolved after fallback"}})
+
+        mock_client = MagicMock()
+        mock_client.request.side_effect = [not_found_response, wiki_response, raw_response]
+
+        request_builder = MagicMock()
+        request_builder.http_method.return_value = request_builder
+        request_builder.uri.return_value = request_builder
+        request_builder.token_types.return_value = request_builder
+        request_builder.paths.return_value = request_builder
+        request_builder.queries.return_value = request_builder
+        request_builder.build.side_effect = ["raw_request_1", "wiki_request", "raw_request_2"]
+
+        fake_lark = MagicMock()
+        fake_lark.AccessTokenType.TENANT = "tenant"
+
+        with patch.object(feishu_doc_tool, "get_client", return_value=mock_client), \
+             patch.dict(
+                 "sys.modules",
+                 {
+                     "lark_oapi": fake_lark,
+                     "lark_oapi.core.enum": MagicMock(HttpMethod=MagicMock(GET="GET")),
+                     "lark_oapi.core.model.base_request": MagicMock(
+                         BaseRequest=MagicMock(builder=MagicMock(return_value=request_builder))
+                     ),
+                 },
+                 clear=False,
+             ):
+            result = feishu_doc_tool._handle_feishu_doc_read({"doc_token": "VuVBwPc1sipNx9kdeGzlp71Mgab"})
+
+        payload = json.loads(result)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["content"], "resolved after fallback")
+        self.assertEqual(mock_client.request.call_count, 3)
+
+    def test_doc_read_returns_error_for_unsupported_wiki_object_type(self):
+        from tools import feishu_doc_tool
+
+        not_found_response = MagicMock()
+        not_found_response.code = 1770002
+        not_found_response.msg = "not found"
+
+        wiki_response = MagicMock()
+        wiki_response.code = 0
+        wiki_response.raw = MagicMock()
+        wiki_response.raw.content = json.dumps(
+            {"data": {"node": {"obj_type": "bitable", "obj_token": "tbl_xxx"}}}
+        )
+
+        mock_client = MagicMock()
+        mock_client.request.side_effect = [not_found_response, wiki_response]
+
+        request_builder = MagicMock()
+        request_builder.http_method.return_value = request_builder
+        request_builder.uri.return_value = request_builder
+        request_builder.token_types.return_value = request_builder
+        request_builder.paths.return_value = request_builder
+        request_builder.queries.return_value = request_builder
+        request_builder.build.side_effect = ["raw_request", "wiki_request"]
+
+        fake_lark = MagicMock()
+        fake_lark.AccessTokenType.TENANT = "tenant"
+
+        with patch.object(feishu_doc_tool, "get_client", return_value=mock_client), \
+             patch.dict(
+                 "sys.modules",
+                 {
+                     "lark_oapi": fake_lark,
+                     "lark_oapi.core.enum": MagicMock(HttpMethod=MagicMock(GET="GET")),
+                     "lark_oapi.core.model.base_request": MagicMock(
+                         BaseRequest=MagicMock(builder=MagicMock(return_value=request_builder))
+                     ),
+                 },
+                 clear=False,
+             ):
+            result = feishu_doc_tool._handle_feishu_doc_read({"doc_token": "VuVBwPc1sipNx9kdeGzlp71Mgab"})
+
+        payload = json.loads(result)
+        self.assertIn("error", payload)
+        self.assertIn("unsupported obj_type=bitable", payload["error"])
 
     def test_doc_read_returns_clear_error_when_no_context_and_no_credentials(self):
         from tools import feishu_doc_tool
