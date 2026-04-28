@@ -771,3 +771,72 @@ class TestReadLoggingConfig:
 
         level, max_size, backup = hermes_logging._read_logging_config()
         assert level is None
+
+def _cleanup_handlers_for_tmp(tmp_path: Path) -> None:
+    root = logging.getLogger()
+    for handler in list(root.handlers):
+        base = getattr(handler, "baseFilename", None)
+        if not base:
+            continue
+        try:
+            path = Path(base).resolve()
+        except Exception:
+            continue
+        if tmp_path.resolve() in path.parents:
+            root.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+
+def test_gateway_log_honors_debug_level(tmp_path):
+    _cleanup_handlers_for_tmp(tmp_path)
+    hermes_logging.setup_logging(
+        hermes_home=tmp_path,
+        mode="gateway",
+        log_level="DEBUG",
+        force=True,
+    )
+
+    logger = logging.getLogger("gateway.platforms.feishu")
+    logger.debug("debug-visible-in-gateway-log")
+
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+    gateway_log = tmp_path / "logs" / "gateway.log"
+    assert gateway_log.exists()
+    assert "debug-visible-in-gateway-log" in gateway_log.read_text(encoding="utf-8")
+
+    _cleanup_handlers_for_tmp(tmp_path)
+
+
+def test_gateway_log_defaults_to_info_when_log_level_info(tmp_path):
+    _cleanup_handlers_for_tmp(tmp_path)
+    hermes_logging.setup_logging(
+        hermes_home=tmp_path,
+        mode="gateway",
+        log_level="INFO",
+        force=True,
+    )
+
+    logger = logging.getLogger("gateway.platforms.feishu")
+    logger.debug("debug-should-not-appear-in-gateway-log")
+    logger.info("info-visible-in-gateway-log")
+
+    for handler in logging.getLogger().handlers:
+        try:
+            handler.flush()
+        except Exception:
+            pass
+
+    gateway_log = tmp_path / "logs" / "gateway.log"
+    text = gateway_log.read_text(encoding="utf-8")
+    assert "info-visible-in-gateway-log" in text
+    assert "debug-should-not-appear-in-gateway-log" not in text
+
+    _cleanup_handlers_for_tmp(tmp_path)

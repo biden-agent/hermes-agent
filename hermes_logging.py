@@ -232,12 +232,16 @@ def setup_logging(
         formatter=RedactingFormatter(_LOG_FORMAT),
     )
 
-    # --- gateway.log (INFO+, gateway component only) ------------------------
+    # --- gateway.log (gateway component only) ---------------------------------
+    # Honor the configured log level so DEBUG-only gateway diagnostics (for
+    # example Feishu mention-gate drops during live verification) are persisted
+    # when logging.level=DEBUG instead of being hidden behind a hard-coded INFO
+    # floor.
     if mode == "gateway":
         _add_rotating_handler(
             root,
             log_dir / "gateway.log",
-            level=logging.INFO,
+            level=level,
             max_bytes=5 * 1024 * 1024,
             backup_count=3,
             formatter=RedactingFormatter(_LOG_FORMAT),
