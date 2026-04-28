@@ -46,6 +46,27 @@ def _resolve_args() -> list[str]:
     return shlex.split(raw)
 
 
+def _normalize_acp_launch(command: str, args: list[str]) -> tuple[str, list[str]]:
+    """Normalize known ACP launcher shapes across third-party CLIs.
+
+    Hermes historically defaulted to Copilot/Claude-style ``--acp --stdio``
+    flags. OpenCode exposes ACP as the ``acp`` subcommand instead, so map the
+    generic default to the CLI's real entrypoint.
+    """
+
+    binary = Path(command).name.lower()
+    if binary.endswith(".exe"):
+        binary = binary[:-4]
+
+    if binary == "opencode":
+        if not args:
+            return command, ["acp"]
+        if args[:2] == ["--acp", "--stdio"]:
+            return command, ["acp", *args[2:]]
+
+    return command, args
+
+
 def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
 
@@ -328,8 +349,12 @@ class CopilotACPClient:
         self.api_key = api_key or "copilot-acp"
         self.base_url = base_url or ACP_MARKER_BASE_URL
         self._default_headers = dict(default_headers or {})
-        self._acp_command = acp_command or command or _resolve_command()
-        self._acp_args = list(acp_args or args or _resolve_args())
+        resolved_command = acp_command or command or _resolve_command()
+        resolved_args = list(acp_args or args or _resolve_args())
+        self._acp_command, self._acp_args = _normalize_acp_launch(
+            resolved_command,
+            resolved_args,
+        )
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False

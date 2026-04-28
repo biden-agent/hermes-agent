@@ -201,3 +201,20 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+
+def test_run_prompt_rewrites_opencode_default_flags_to_acp_subcommand(tmp_path):
+    captured = {}
+    client = CopilotACPClient(
+        api_key="copilot-acp",
+        base_url="acp://copilot",
+        acp_command="opencode",
+        acp_args=["--acp", "--stdio"],
+        acp_cwd=str(tmp_path),
+    )
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hello", timeout_seconds=1)
+
+    assert captured["cmd"] == ["opencode", "acp"]

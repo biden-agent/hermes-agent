@@ -36,6 +36,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -233,6 +234,12 @@ def _validate_workdir(workdir: str) -> str | None:
                 )
         return "Blocked: workdir contains disallowed characters."
     return None
+
+
+def _normalize_workdir(workdir: str) -> str:
+    """Expand user-home shorthand in per-call working directories."""
+
+    return os.path.expanduser(workdir)
 
 
 def _handle_sudo_failure(output: str, env_type: str) -> str:
@@ -1414,6 +1421,103 @@ def _foreground_background_guidance(command: str) -> str | None:
     return None
 
 
+def _split_shell_segments(command: str) -> list[str]:
+    """Split a shell command into coarse command segments.
+
+    This is intentionally shallow: enough to inspect chained commands like
+    ``cd repo && python -m hermes_cli.main gateway run --replace`` without
+    needing a full shell parser.
+    """
+
+    return [seg.strip() for seg in re.split(r"\s*(?:&&|\|\||[;|])\s*", command) if seg.strip()]
+
+
+def _is_gateway_run_invocation(segment: str) -> bool:
+    """Return True when a shell segment launches ``hermes gateway run``."""
+
+    try:
+        tokens = shlex.split(segment)
+    except ValueError:
+        return False
+
+    if not tokens:
+        return False
+
+    i = 0
+    while i < len(tokens) and _looks_like_env_assignment(tokens[i]):
+        i += 1
+
+    while i < len(tokens) and tokens[i] in {"time"}:
+        i += 1
+
+    if i < len(tokens) and tokens[i] == "sudo":
+        i += 1
+        while i < len(tokens) and tokens[i].startswith("-"):
+            i += 1
+
+    if i >= len(tokens):
+        return False
+
+    executable = os.path.basename(tokens[i])
+
+    if executable in {"bash", "sh", "zsh"}:
+        for idx in range(i + 1, len(tokens) - 1):
+            flag = tokens[idx]
+            if not flag.startswith("-"):
+                break
+            if "c" in flag[1:]:
+                inner = tokens[idx + 1]
+                return any(
+                    _is_gateway_run_invocation(inner_segment)
+                    for inner_segment in _split_shell_segments(inner)
+                )
+        return False
+
+    j = i + 1
+
+    if executable.startswith("python"):
+        if j + 1 < len(tokens) and tokens[j] == "-m" and tokens[j + 1] == "hermes_cli.main":
+            j += 2
+        elif j < len(tokens) and tokens[j].endswith("hermes_cli/main.py"):
+            j += 1
+        else:
+            return False
+    elif executable not in {"hermes", "hermes_cli.main"}:
+        return False
+
+    while j < len(tokens):
+        if tokens[j] in {"--profile", "-p"} and j + 1 < len(tokens):
+            j += 2
+            continue
+        break
+
+    return j + 1 < len(tokens) and tokens[j] == "gateway" and tokens[j + 1] == "run"
+
+
+def _background_gateway_run_guidance(command: str) -> str | None:
+    """Reject background-managed gateway runs that bypass the service manager."""
+
+    if _looks_like_help_or_version_command(command):
+        return None
+
+    message = (
+        "Starting Hermes gateway with terminal(background=true) creates an unmanaged "
+        "gateway process that can survive service restarts and leave dual instances running. "
+        "Use `hermes gateway start`/`hermes gateway restart` for the installed service, "
+        "or run `hermes gateway run` manually in a dedicated foreground terminal when you "
+        "explicitly want a one-off foreground gateway."
+    )
+
+    if _is_gateway_run_invocation(command):
+        return message
+
+    for segment in _split_shell_segments(command):
+        if _is_gateway_run_invocation(segment):
+            return message
+
+    return None
+
+
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
@@ -1547,6 +1651,15 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+        else:
+            guidance = _background_gateway_run_guidance(command)
+            if guidance:
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": guidance,
+                    "status": "blocked",
+                }, ensure_ascii=False)
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -1676,6 +1789,7 @@ def terminal_tool(
                 approval_note = f"Command was flagged ({desc}) and auto-approved by smart approval."
 
         # Validate workdir against shell injection
+        normalized_workdir = None
         if workdir:
             workdir_error = _validate_workdir(workdir)
             if workdir_error:
@@ -1687,6 +1801,7 @@ def terminal_tool(
                     "error": workdir_error,
                     "status": "blocked"
                 }, ensure_ascii=False)
+            normalized_workdir = _normalize_workdir(workdir)
 
         # Prepare command for execution
         pty_disabled_reason = None
@@ -1708,7 +1823,7 @@ def terminal_tool(
             from tools.process_registry import process_registry
 
             session_key = get_current_session_key(default="")
-            effective_cwd = workdir or cwd
+            effective_cwd = normalized_workdir or cwd
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -1816,8 +1931,8 @@ def terminal_tool(
             while retry_count <= max_retries:
                 try:
                     execute_kwargs = {"timeout": effective_timeout}
-                    if workdir:
-                        execute_kwargs["cwd"] = workdir
+                    if normalized_workdir:
+                        execute_kwargs["cwd"] = normalized_workdir
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
                     error_str = str(e).lower()

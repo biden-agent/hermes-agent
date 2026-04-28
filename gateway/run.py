@@ -5041,6 +5041,16 @@ class GatewayRunner:
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            if agent_result.get("interrupted") and _is_control_interrupt_message(
+                agent_result.get("interrupt_message")
+            ):
+                logger.info(
+                    "Suppressing final response for control interrupt in session %s: %s",
+                    _quick_key or "?",
+                    agent_result.get("interrupt_message"),
+                )
+                return None
+
             response = agent_result.get("final_response") or ""
 
             # Convert the agent's internal "(empty)" sentinel into a
