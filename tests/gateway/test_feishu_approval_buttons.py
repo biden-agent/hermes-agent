@@ -58,6 +58,7 @@ def _make_card_action_data(
     action_value: dict,
     chat_id: str = "oc_12345",
     open_id: str = "ou_user1",
+    user_id: str = "u_user1",
     token: str = "tok_abc",
 ) -> SimpleNamespace:
     """Create a mock Feishu card action callback data object."""
@@ -65,7 +66,7 @@ def _make_card_action_data(
         event=SimpleNamespace(
             token=token,
             context=SimpleNamespace(open_chat_id=chat_id),
-            operator=SimpleNamespace(open_id=open_id),
+            operator=SimpleNamespace(open_id=open_id, user_id=user_id),
             action=SimpleNamespace(
                 tag="button",
                 value=action_value,
@@ -152,6 +153,34 @@ class TestFeishuExecApproval:
         assert state["session_key"] == "my-session-key"
         assert state["message_id"] == "msg_002"
         assert state["chat_id"] == "oc_12345"
+
+    @pytest.mark.asyncio
+    async def test_stores_requester_identity_from_metadata_source(self):
+        adapter = _make_adapter()
+
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_requester"),
+        )
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            await adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="echo test",
+                session_key="my-session-key",
+                metadata={
+                    "source": {
+                        "user_id": "ou_requester",
+                        "user_id_alt": "u_requester",
+                    },
+                },
+            )
+
+        state = next(iter(adapter._approval_state.values()))
+        assert state["requester_open_id"] == "ou_requester"
+        assert state["requester_user_id"] == "u_requester"
 
     @pytest.mark.asyncio
     async def test_not_connected(self):
@@ -371,6 +400,116 @@ class TestCardActionCallbackResponse:
         assert 1 in adapter._approval_state
         mock_submit.assert_called_once()
 
+    def test_unauthorized_click_does_not_resolve_or_pop_approval(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._approval_state[10] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_010",
+            "chat_id": "oc_12345",
+            "requester_open_id": "ou_requester",
+            "requester_user_id": "u_requester",
+        }
+        loop = MagicMock()
+        event = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 10},
+            open_id="ou_intruder",
+            user_id="u_intruder",
+        ).event
+
+        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=event.action.value,
+                loop=loop,
+            )
+
+        assert response is not None
+        assert response.card is not None
+        assert response.card.data["header"]["template"] == "orange"
+        assert "only the original requester or bot admins" in response.card.data["elements"][0]["content"].lower()
+        assert 10 in adapter._approval_state
+        mock_submit.assert_not_called()
+
+    def test_original_requester_click_resolves_approval(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._approval_state[11] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_011",
+            "chat_id": "oc_12345",
+            "requester_open_id": "ou_requester",
+            "requester_user_id": "u_requester",
+        }
+        loop = MagicMock()
+        event = _make_card_action_data(
+            {"hermes_action": "approve_session", "approval_id": 11},
+            open_id="ou_requester",
+            user_id="u_different",
+        ).event
+
+        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=event.action.value,
+                loop=loop,
+            )
+
+        assert response.card.data["header"]["template"] == "green"
+        assert "Approved for session" in response.card.data["header"]["title"]["content"]
+        assert 11 in adapter._approval_state
+        mock_submit.assert_called_once()
+
+    def test_bot_admin_click_resolves_approval(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._admins = {"u_admin"}
+        adapter._approval_state[12] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_012",
+            "chat_id": "oc_12345",
+            "requester_open_id": "ou_requester",
+            "requester_user_id": "u_requester",
+        }
+        loop = MagicMock()
+        event = _make_card_action_data(
+            {"hermes_action": "deny", "approval_id": 12},
+            open_id="ou_admin",
+            user_id="u_admin",
+        ).event
+
+        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=event.action.value,
+                loop=loop,
+            )
+
+        assert response.card.data["header"]["template"] == "red"
+        assert "Denied" in response.card.data["header"]["title"]["content"]
+        assert 12 in adapter._approval_state
+        mock_submit.assert_called_once()
+
+    def test_stale_approval_click_returns_already_resolved_card(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        loop = MagicMock()
+        event = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 99},
+            open_id="ou_late_clicker",
+            user_id="u_late_clicker",
+        ).event
+
+        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=event.action.value,
+                loop=loop,
+            )
+
+        assert response is not None
+        assert response.card is not None
+        assert response.card.data["header"]["template"] == "grey"
+        assert "Already resolved" in response.card.data["header"]["title"]["content"]
+        assert "no longer pending" in response.card.data["elements"][0]["content"].lower()
+        mock_submit.assert_not_called()
+
     def test_drops_action_when_loop_not_ready(self, _patch_callback_card_types):
         adapter = _make_adapter()
         adapter._loop = None
@@ -391,6 +530,11 @@ class TestCardActionCallbackResponse:
             {"hermes_action": "approve_once", "approval_id": 1},
             open_id="ou_bob",
         )
+        adapter._approval_state[1] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_001",
+            "chat_id": "oc_12345",
+        }
         adapter._sender_name_cache["ou_bob"] = ("Bob", 9999999999)
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
@@ -411,6 +555,11 @@ class TestCardActionCallbackResponse:
         data = _make_card_action_data(
             {"hermes_action": "deny", "approval_id": 2},
         )
+        adapter._approval_state[2] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_002",
+            "chat_id": "oc_12345",
+        }
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
             response = adapter._on_card_action_trigger(data)
@@ -453,6 +602,11 @@ class TestCardActionCallbackResponse:
             {"hermes_action": "approve_session", "approval_id": 3},
             open_id="ou_unknown",
         )
+        adapter._approval_state[3] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_003",
+            "chat_id": "oc_12345",
+        }
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):
             response = adapter._on_card_action_trigger(data)
@@ -468,6 +622,11 @@ class TestCardActionCallbackResponse:
             {"hermes_action": "approve_once", "approval_id": 4},
             open_id="ou_expired",
         )
+        adapter._approval_state[4] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_004",
+            "chat_id": "oc_12345",
+        }
         adapter._sender_name_cache["ou_expired"] = ("Old Name", 1)
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=_close_submitted_coro):

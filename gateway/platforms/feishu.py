@@ -1392,7 +1392,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
-        # Exec approval button state (approval_id → {session_key, message_id, chat_id})
+        # Exec approval button state (approval_id → session/message/requester IDs)
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
         # Feishu reaction deletion requires the opaque reaction_id returned
@@ -1830,15 +1830,61 @@ class FeishuAdapter(BasePlatformAdapter):
 
             result = self._finalize_send_result(response, "send_exec_approval failed")
             if result.success:
-                self._approval_state[approval_id] = {
+                state = {
                     "session_key": session_key,
                     "message_id": result.message_id or "",
                     "chat_id": chat_id,
                 }
+                state.update(self._approval_requester_state(metadata))
+                self._approval_state[approval_id] = state
             return result
         except Exception as exc:
             logger.warning("[Feishu] send_exec_approval failed: %s", exc)
             return SendResult(success=False, error=str(exc))
+
+    @staticmethod
+    def _metadata_field(value: Any, key: str) -> str:
+        if isinstance(value, dict):
+            raw = value.get(key)
+        else:
+            raw = getattr(value, key, None)
+        return str(raw or "").strip()
+
+    @classmethod
+    def _approval_requester_state(cls, metadata: Optional[Dict[str, Any]]) -> Dict[str, str]:
+        """Extract the original requester IDs from approval metadata when present."""
+        if not isinstance(metadata, dict):
+            return {}
+
+        source = metadata.get("source")
+        open_id = (
+            cls._metadata_field(metadata, "requester_open_id")
+            or cls._metadata_field(metadata, "open_id")
+            or cls._metadata_field(source, "open_id")
+        )
+        user_id = (
+            cls._metadata_field(metadata, "requester_user_id")
+            or cls._metadata_field(metadata, "user_id")
+            or cls._metadata_field(source, "feishu_user_id")
+        )
+
+        source_user_id = cls._metadata_field(source, "user_id")
+        if source_user_id:
+            if source_user_id.startswith("ou_") and not open_id:
+                open_id = source_user_id
+            elif not user_id:
+                user_id = source_user_id
+
+        source_alt_id = cls._metadata_field(source, "user_id_alt")
+        if source_alt_id and not user_id:
+            user_id = source_alt_id
+
+        state: Dict[str, str] = {}
+        if open_id:
+            state["requester_open_id"] = open_id
+        if user_id:
+            state["requester_user_id"] = user_id
+        return state
 
     @staticmethod
     def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
@@ -1855,6 +1901,40 @@ class FeishuAdapter(BasePlatformAdapter):
                 {
                     "tag": "markdown",
                     "content": f"{icon} **{label}** by {user_name}",
+                },
+            ],
+        }
+
+    @staticmethod
+    def _build_unauthorized_approval_card() -> Dict[str, Any]:
+        """Build raw card JSON for an unauthorized approval button click."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "Approval Restricted", "tag": "plain_text"},
+                "template": "orange",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "Only the original requester or bot admins can approve this action.",
+                },
+            ],
+        }
+
+    @staticmethod
+    def _build_stale_approval_card() -> Dict[str, Any]:
+        """Build raw card JSON for a late click on an already-resolved approval."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "Already resolved", "tag": "plain_text"},
+                "template": "grey",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": "This approval is no longer pending.",
                 },
             ],
         }
@@ -2466,17 +2546,52 @@ class FeishuAdapter(BasePlatformAdapter):
 
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
+        user_id = str(getattr(operator, "user_id", "") or "")
         user_name = self._get_cached_sender_name(open_id) or open_id
+
+        state = self._approval_state.get(approval_id)
+        if state is None:
+            logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
+            return self._approval_callback_response(self._build_stale_approval_card())
+        if not self._is_approval_operator_authorized(state, open_id=open_id, user_id=user_id):
+            logger.info(
+                "Ignoring unauthorized Feishu approval click for approval %s (open_id=%s, user_id=%s)",
+                approval_id, open_id, user_id,
+            )
+            return self._approval_callback_response(self._build_unauthorized_approval_card())
 
         self._submit_on_loop(loop, self._resolve_approval(approval_id, choice, user_name))
 
+        return self._approval_callback_response(
+            self._build_resolved_approval_card(choice=choice, user_name=user_name)
+        )
+
+    def _is_approval_operator_authorized(self, state: Dict[str, str], *, open_id: str, user_id: str) -> bool:
+        operator_ids = {value for value in (open_id, user_id) if value}
+        if operator_ids & self._admins:
+            return True
+
+        requester_ids = {
+            value
+            for value in (
+                state.get("requester_open_id"),
+                state.get("requester_user_id"),
+            )
+            if value
+        }
+        if not requester_ids:
+            return True
+        return bool(operator_ids & requester_ids)
+
+    @staticmethod
+    def _approval_callback_response(card_data: Dict[str, Any]) -> Any:
         if P2CardActionTriggerResponse is None:
             return None
         response = P2CardActionTriggerResponse()
         if CallBackCard is not None:
             card = CallBackCard()
             card.type = "raw"
-            card.data = self._build_resolved_approval_card(choice=choice, user_name=user_name)
+            card.data = card_data
             response.card = card
         return response
 

@@ -1574,6 +1574,93 @@ def _background_gateway_run_guidance(command: str) -> str | None:
     return None
 
 
+def _get_gateway_terminal_command_allowlist() -> list[str]:
+    """Return the current session's effective terminal command allowlist."""
+    try:
+        from gateway.session_context import get_session_env
+
+        raw = get_session_env("HERMES_SESSION_TERMINAL_COMMAND_ALLOWLIST", "")
+    except Exception:
+        raw = os.getenv("HERMES_SESSION_TERMINAL_COMMAND_ALLOWLIST", "")
+    return sorted({part.strip().lower() for part in raw.split(",") if part.strip()})
+
+
+def _contains_unquoted_shell_substitution(command: str) -> bool:
+    """Return True when a command contains unquoted shell substitution syntax."""
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if ch == "\\" and not in_single:
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_single and not in_double:
+            if ch == "`":
+                return True
+            if ch == "$" and i + 1 < len(command) and command[i + 1] in {"(", "{"}:
+                return True
+        i += 1
+    return False
+
+
+def _resolve_restricted_terminal_base_command(command: str) -> str | None:
+    """Extract the standalone executable name for restricted gateway sessions."""
+    if _contains_unquoted_shell_substitution(command):
+        return None
+
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|&;<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    if not tokens:
+        return None
+
+    if any(token and set(token) <= set("|&;<>") for token in tokens):
+        return None
+
+    i = 0
+    while i < len(tokens) and _looks_like_env_assignment(tokens[i]):
+        i += 1
+    while i < len(tokens) and tokens[i] == "time":
+        i += 1
+    if i >= len(tokens):
+        return None
+
+    base_cmd = os.path.basename(tokens[i]).strip().lower()
+    return base_cmd or None
+
+
+def _check_gateway_terminal_command_allowlist(command: str) -> str | None:
+    """Block non-allowlisted terminal commands in restricted gateway sessions."""
+    allowed_commands = _get_gateway_terminal_command_allowlist()
+    if not allowed_commands:
+        return None
+
+    base_cmd = _resolve_restricted_terminal_base_command(command)
+    if base_cmd and base_cmd in allowed_commands:
+        return None
+
+    allowed_display = ", ".join(allowed_commands)
+    return (
+        "Terminal access is restricted in this chat. "
+        f"Allowed standalone commands: {allowed_display}. "
+        "Shell pipelines, chaining, redirections, and substitutions are not permitted."
+    )
+
+
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
@@ -1810,6 +1897,18 @@ def terminal_tool(
         # Pre-exec security checks (tirith + dangerous command detection)
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
+        terminal_policy_error = _check_gateway_terminal_command_allowlist(command)
+        if terminal_policy_error:
+            logger.warning(
+                "Blocked restricted gateway terminal command: %s",
+                _safe_command_preview(command),
+            )
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": terminal_policy_error,
+                "status": "blocked",
+            }, ensure_ascii=False)
         if not force:
             approval = _check_all_guards(command, env_type)
             if not approval["approved"]:

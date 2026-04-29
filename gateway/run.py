@@ -3772,6 +3772,38 @@ class GatewayRunner:
 
         return enabled_toolsets
 
+    def _resolve_effective_terminal_command_allowlist(
+        self,
+        *,
+        user_config: Dict[str, Any],
+        source: SessionSource,
+        actor_ids: Optional[set[str]] = None,
+    ) -> Optional[list[str]]:
+        """Return the member-scoped terminal command allowlist when configured."""
+        platform = getattr(source, "platform", None)
+        extra = self._get_platform_extra_from_user_config(user_config, platform)
+        permissions = extra.get("tool_permissions")
+        if not isinstance(permissions, dict):
+            return None
+        if "enabled" in permissions and not is_truthy_value(permissions.get("enabled"), default=True):
+            return None
+
+        admin_values = permissions.get("admins")
+        if admin_values is None:
+            admin_values = extra.get("admins", [])
+        admin_ids = self._normalize_identity_values(admin_values)
+        effective_actor_ids = set(actor_ids or ()) or self._collect_source_sender_ids(source)
+        if admin_ids and effective_actor_ids and (admin_ids & effective_actor_ids):
+            return None
+
+        allowed_commands = self._normalize_string_values(
+            permissions.get("allowed_terminal_commands"),
+            lowercase=True,
+        )
+        if not allowed_commands or "*" in allowed_commands:
+            return None
+        return sorted(allowed_commands)
+
     @staticmethod
     def _format_command_permission_denial(
         *,
@@ -4918,9 +4950,20 @@ class GatewayRunner:
         
         # Build session context
         context = build_session_context(source, self.config, session_entry)
+
+        actor_ids = self._collect_event_sender_ids(event)
+        _session_user_config = _load_gateway_config()
+        _terminal_command_allowlist = self._resolve_effective_terminal_command_allowlist(
+            user_config=_session_user_config,
+            source=source,
+            actor_ids=actor_ids,
+        )
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(
+            context,
+            terminal_command_allowlist=_terminal_command_allowlist,
+        )
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -5446,7 +5489,7 @@ class GatewayRunner:
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
-                actor_ids=self._collect_event_sender_ids(event),
+                actor_ids=actor_ids,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -9150,7 +9193,12 @@ class GatewayRunner:
         finally:
             notify_path.unlink(missing_ok=True)
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self,
+        context: SessionContext,
+        *,
+        terminal_command_allowlist: Optional[list[str]] = None,
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -9168,6 +9216,7 @@ class GatewayRunner:
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            terminal_command_allowlist=",".join(terminal_command_allowlist or []),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -11229,13 +11278,21 @@ class GatewayRunner:
                 # false positives from MagicMock auto-attribute creation in tests.
                 if getattr(type(_status_adapter), "send_exec_approval", None) is not None:
                     try:
+                        _approval_metadata = {
+                            "source": {
+                                "user_id": getattr(source, "user_id", None),
+                                "user_id_alt": getattr(source, "user_id_alt", None),
+                            },
+                        }
+                        if _status_thread_metadata:
+                            _approval_metadata.update(_status_thread_metadata)
                         _approval_result = asyncio.run_coroutine_threadsafe(
                             _status_adapter.send_exec_approval(
                                 chat_id=_status_chat_id,
                                 command=cmd,
                                 session_key=_approval_session_key,
                                 description=desc,
-                                metadata=_status_thread_metadata,
+                                metadata=_approval_metadata,
                             ),
                             _loop_for_step,
                         ).result(timeout=15)
