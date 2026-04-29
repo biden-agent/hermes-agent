@@ -77,9 +77,14 @@ def _make_card_action_data(
 
 
 def _close_submitted_coro(coro, _loop):
-    """Close scheduled coroutines in sync-handler tests to avoid unawaited warnings."""
+    """Close coroutines submitted through asyncio.run_coroutine_threadsafe in tests."""
     coro.close()
     return SimpleNamespace(add_done_callback=lambda *_args, **_kwargs: None)
+
+
+def _close_adapter_submitted_coro(_loop, coro):
+    """Close coroutines passed to FeishuAdapter._submit_on_loop in sync-handler tests."""
+    coro.close()
 
 
 # ===========================================================================
@@ -446,7 +451,7 @@ class TestCardActionCallbackResponse:
             user_id="u_intruder",
         ).event
 
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+        with patch.object(adapter, "_submit_on_loop", side_effect=_close_adapter_submitted_coro) as mock_submit:
             response = adapter._handle_approval_card_action(
                 event=event,
                 action_value=event.action.value,
@@ -476,7 +481,7 @@ class TestCardActionCallbackResponse:
             user_id="u_different",
         ).event
 
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+        with patch.object(adapter, "_submit_on_loop", side_effect=_close_adapter_submitted_coro) as mock_submit:
             response = adapter._handle_approval_card_action(
                 event=event,
                 action_value=event.action.value,
@@ -506,7 +511,7 @@ class TestCardActionCallbackResponse:
             union_id="on_requester",
         ).event
 
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+        with patch.object(adapter, "_submit_on_loop", side_effect=_close_adapter_submitted_coro) as mock_submit:
             response = adapter._handle_approval_card_action(
                 event=event,
                 action_value=event.action.value,
@@ -535,7 +540,7 @@ class TestCardActionCallbackResponse:
             user_id="u_admin",
         ).event
 
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+        with patch.object(adapter, "_submit_on_loop", side_effect=_close_adapter_submitted_coro) as mock_submit:
             response = adapter._handle_approval_card_action(
                 event=event,
                 action_value=event.action.value,
@@ -566,7 +571,7 @@ class TestCardActionCallbackResponse:
             union_id="on_admin",
         ).event
 
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+        with patch.object(adapter, "_submit_on_loop", side_effect=_close_adapter_submitted_coro) as mock_submit:
             response = adapter._handle_approval_card_action(
                 event=event,
                 action_value=event.action.value,
@@ -594,7 +599,7 @@ class TestCardActionCallbackResponse:
             union_id="on_intruder",
         ).event
 
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+        with patch.object(adapter, "_submit_on_loop", side_effect=_close_adapter_submitted_coro) as mock_submit:
             response = adapter._handle_approval_card_action(
                 event=event,
                 action_value=event.action.value,
@@ -615,7 +620,7 @@ class TestCardActionCallbackResponse:
             user_id="u_late_clicker",
         ).event
 
-        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+        with patch.object(adapter, "_submit_on_loop", side_effect=_close_adapter_submitted_coro) as mock_submit:
             response = adapter._handle_approval_card_action(
                 event=event,
                 action_value=event.action.value,
