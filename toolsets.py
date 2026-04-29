@@ -247,6 +247,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "curl": {
+        "description": "Safe HTTP/HTTPS request tool with no local file access",
+        "tools": ["curl"],
+        "includes": []
+    },
+
     "spotify": {
         "description": "Native Spotify playback, search, playlist, album, and library tools",
         "tools": [
@@ -419,6 +425,7 @@ TOOLSETS = {
     "hermes-feishu": {
         "description": "Feishu/Lark bot toolset - enterprise messaging via Feishu/Lark (full access)",
         "tools": _HERMES_CORE_TOOLS + [
+            "curl",
             "feishu_doc_read",
             "feishu_drive_list_comments",
             "feishu_drive_list_comment_replies",

@@ -831,6 +831,7 @@ def test_save_platform_tools_strips_restricted_toolsets():
 
 def test_get_platform_tools_feishu_includes_doc_and_drive():
     enabled = _get_platform_tools({}, "feishu")
+    assert "curl" in enabled
     assert "feishu_doc" in enabled
     assert "feishu_drive" in enabled
 

@@ -232,6 +232,37 @@ def test_feishu_member_tool_permissions_limit_enabled_toolsets(monkeypatch):
     assert enabled == ["web"]
 
 
+def test_feishu_member_can_get_curl_without_terminal(monkeypatch):
+    import hermes_cli.tools_config as tools_config
+
+    runner = _make_runner(
+        admins=["ou_admin"],
+        tool_permissions={"allowed_toolsets": ["curl", "web"]},
+    )
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda *_args, **_kwargs: {"curl", "terminal", "web"},
+    )
+
+    enabled = runner._resolve_effective_enabled_toolsets(
+        user_config={
+            "platforms": {
+                "feishu": {
+                    "extra": {
+                        "admins": ["ou_admin"],
+                        "tool_permissions": {"allowed_toolsets": ["curl", "web"]},
+                    }
+                }
+            }
+        },
+        source=_make_source(),
+        actor_ids={"u_member"},
+    )
+
+    assert enabled == ["curl", "web"]
+
+
 def test_feishu_admin_tool_permissions_bypass_member_limits(monkeypatch):
     import hermes_cli.tools_config as tools_config
 
