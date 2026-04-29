@@ -88,6 +88,146 @@ def _origin_from_env() -> Optional[Dict[str, str]]:
     return None
 
 
+def _owner_from_env() -> Optional[Dict[str, str]]:
+    from gateway.session_context import get_session_env
+
+    platform = (get_session_env("HERMES_SESSION_PLATFORM") or "").strip()
+    user_id = (get_session_env("HERMES_SESSION_USER_ID") or "").strip()
+    if not platform or not user_id:
+        return None
+    owner = {
+        "platform": platform,
+        "user_id": user_id,
+    }
+    user_id_alt = (get_session_env("HERMES_SESSION_USER_ID_ALT") or "").strip()
+    user_name = (get_session_env("HERMES_SESSION_USER_NAME") or "").strip()
+    if user_id_alt:
+        owner["user_id_alt"] = user_id_alt
+    if user_name:
+        owner["user_name"] = user_name
+    return owner
+
+
+def _gateway_owner_scope() -> Optional[Dict[str, str]]:
+    return _owner_from_env()
+
+
+def _identity_values(*values: Any) -> set[str]:
+    return {str(v).strip() for v in values if str(v or "").strip()}
+
+
+def _configured_platform_admins(platform: str) -> set[str]:
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        return set()
+    platforms = cfg.get("platforms") if isinstance(cfg, dict) else {}
+    platform_cfg = platforms.get(platform) if isinstance(platforms, dict) else {}
+    if not isinstance(platform_cfg, dict):
+        return set()
+    extra = platform_cfg.get("extra") if isinstance(platform_cfg.get("extra"), dict) else {}
+    raw_admins = platform_cfg.get("admins")
+    if raw_admins is None:
+        raw_admins = extra.get("admins", [])
+    if isinstance(raw_admins, str):
+        raw_admins = [raw_admins]
+    return _identity_values(*(raw_admins or []))
+
+
+def _current_user_is_admin(owner: Optional[Dict[str, str]] = None) -> bool:
+    owner = owner or _owner_from_env()
+    if not owner:
+        return True
+    platform = owner.get("platform", "")
+    if not platform:
+        return True
+    admin_ids = _configured_platform_admins(platform)
+    if not admin_ids:
+        return False
+    actor_ids = _identity_values(owner.get("user_id"), owner.get("user_id_alt"))
+    return bool(actor_ids & admin_ids)
+
+
+def _job_owned_by(job: Dict[str, Any], owner: Dict[str, str]) -> bool:
+    job_owner = job.get("owner")
+    if not isinstance(job_owner, dict):
+        return False
+    if job_owner.get("platform") != owner.get("platform"):
+        return False
+    job_ids = _identity_values(job_owner.get("user_id"), job_owner.get("user_id_alt"))
+    owner_ids = _identity_values(owner.get("user_id"), owner.get("user_id_alt"))
+    return bool(job_ids & owner_ids)
+
+
+def _can_access_job(job: Dict[str, Any], owner: Optional[Dict[str, str]], is_admin: bool) -> bool:
+    if not owner or is_admin:
+        return True
+    return _job_owned_by(job, owner)
+
+
+def _permission_error(job_id: str) -> str:
+    return json.dumps(
+        {"success": False, "error": f"Permission denied for cron job '{job_id}'."},
+        indent=2,
+    )
+
+
+def _parse_session_toolsets() -> Optional[List[str]]:
+    from gateway.session_context import get_session_env
+
+    raw = get_session_env("HERMES_SESSION_ENABLED_TOOLSETS") or ""
+    toolsets = [item.strip() for item in raw.split(",") if item.strip()]
+    if not toolsets:
+        return None
+    return [toolset for toolset in toolsets if toolset != "cronjob"] or None
+
+
+def _derive_platform_toolsets(platform: str) -> Optional[List[str]]:
+    if not platform:
+        return None
+    try:
+        from hermes_cli.config import load_config
+        from hermes_cli.tools_config import _get_platform_tools
+
+        toolsets = sorted(_get_platform_tools(load_config(), platform))
+    except Exception:
+        return None
+    return [toolset for toolset in toolsets if toolset != "cronjob"] or None
+
+
+def _resolve_create_toolsets(
+    explicit_toolsets: Optional[List[str]],
+    owner: Optional[Dict[str, str]],
+    is_admin: bool,
+) -> tuple[Optional[List[str]], bool, Optional[str]]:
+    inherited = _parse_session_toolsets()
+    if owner and inherited is None:
+        inherited = _derive_platform_toolsets(owner.get("platform", ""))
+    if owner and inherited is None:
+        return None, False, (
+            "enabled_toolsets could not be resolved from the current session scope; "
+            "gateway-owned cron jobs must inherit an explicit session or platform toolset scope."
+        )
+
+    normalized_explicit = [str(t).strip() for t in explicit_toolsets or [] if str(t).strip()]
+    normalized_explicit = [t for t in normalized_explicit if t != "cronjob"]
+    if normalized_explicit:
+        if owner and not is_admin and inherited is not None:
+            disallowed = sorted(set(normalized_explicit) - set(inherited))
+            if disallowed:
+                return None, False, (
+                    "enabled_toolsets may not include toolsets outside the current session scope: "
+                    + ", ".join(disallowed)
+                )
+        return normalized_explicit, False, None
+
+    if owner and inherited:
+        return inherited, True, None
+    return None, False, None
+
+
 def _repeat_display(job: Dict[str, Any]) -> str:
     times = (job.get("repeat") or {}).get("times")
     completed = (job.get("repeat") or {}).get("completed", 0)
@@ -248,6 +388,8 @@ def cronjob(
 
     try:
         normalized = (action or "").strip().lower()
+        current_owner = _gateway_owner_scope()
+        current_is_admin = _current_user_is_admin(current_owner)
 
         if normalized == "create":
             if not schedule:
@@ -271,12 +413,23 @@ def cronjob(
                 from cron.jobs import get_job as _get_job
                 refs = [context_from] if isinstance(context_from, str) else context_from
                 for ref_id in refs:
-                    if not _get_job(ref_id):
+                    ref_job = _get_job(ref_id)
+                    if not ref_job:
                         return tool_error(
                             f"context_from job '{ref_id}' not found. "
                             "Use cronjob(action='list') to see available jobs.",
                             success=False,
                         )
+                    if not _can_access_job(ref_job, current_owner, current_is_admin):
+                        return _permission_error(ref_id)
+
+            resolved_toolsets, toolsets_inherited, toolset_error = _resolve_create_toolsets(
+                enabled_toolsets,
+                current_owner,
+                current_is_admin,
+            )
+            if toolset_error:
+                return tool_error(toolset_error, success=False)
 
             job = create_job(
                 prompt=prompt or "",
@@ -285,13 +438,15 @@ def cronjob(
                 repeat=repeat,
                 deliver=deliver,
                 origin=_origin_from_env(),
+                owner=current_owner,
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
                 context_from=context_from,
-                enabled_toolsets=enabled_toolsets or None,
+                enabled_toolsets=resolved_toolsets,
+                toolsets_inherited=toolsets_inherited,
                 workdir=_normalize_optional_job_value(workdir),
             )
             return json.dumps(
@@ -312,7 +467,10 @@ def cronjob(
             )
 
         if normalized == "list":
-            jobs = [_format_job(job) for job in list_jobs(include_disabled=include_disabled)]
+            raw_jobs = list_jobs(include_disabled=include_disabled)
+            if current_owner and not current_is_admin:
+                raw_jobs = [job for job in raw_jobs if _job_owned_by(job, current_owner)]
+            jobs = [_format_job(job) for job in raw_jobs]
             return json.dumps({"success": True, "count": len(jobs), "jobs": jobs}, indent=2)
 
         if not job_id:
@@ -324,6 +482,8 @@ def cronjob(
                 {"success": False, "error": f"Job with ID '{job_id}' not found. Use cronjob(action='list') to inspect jobs."},
                 indent=2,
             )
+        if not _can_access_job(job, current_owner, current_is_admin):
+            return _permission_error(job_id)
 
         if normalized == "remove":
             removed = remove_job(job_id)
@@ -393,15 +553,26 @@ def cronjob(
                 if refs:
                     from cron.jobs import get_job as _get_job
                     for ref_id in refs:
-                        if not _get_job(ref_id):
+                        ref_job = _get_job(ref_id)
+                        if not ref_job:
                             return tool_error(
                                 f"context_from job '{ref_id}' not found. "
                                 "Use cronjob(action='list') to see available jobs.",
                                 success=False,
                             )
+                        if not _can_access_job(ref_job, current_owner, current_is_admin):
+                            return _permission_error(ref_id)
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
-                updates["enabled_toolsets"] = enabled_toolsets or None
+                resolved_toolsets, toolsets_inherited, toolset_error = _resolve_create_toolsets(
+                    enabled_toolsets,
+                    current_owner,
+                    current_is_admin,
+                )
+                if toolset_error:
+                    return tool_error(toolset_error, success=False)
+                updates["enabled_toolsets"] = resolved_toolsets
+                updates["toolsets_inherited"] = toolsets_inherited
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.

@@ -856,6 +856,26 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["terminal"]
 
+    def test_run_job_uses_inherited_toolsets_stored_on_job(self, tmp_path):
+        job = {
+            "id": "inherited-toolset-job",
+            "name": "test",
+            "prompt": "hello",
+            "enabled_toolsets": ["web", "terminal"],
+            "toolsets_inherited": True,
+        }
+        fake_db, patches = self._make_run_job_patches(tmp_path)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+             patch("run_agent.AIAgent") as mock_agent_cls, \
+             patch("hermes_cli.tools_config._get_platform_tools", return_value={"file"}):
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ["web", "terminal"]
+
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
 

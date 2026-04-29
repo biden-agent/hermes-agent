@@ -4983,6 +4983,11 @@ class GatewayRunner:
 
         actor_ids = self._collect_event_sender_ids(event)
         _session_user_config = _load_gateway_config()
+        _session_enabled_toolsets = self._resolve_effective_enabled_toolsets(
+            user_config=_session_user_config,
+            source=source,
+            actor_ids=actor_ids,
+        )
         _terminal_command_allowlist = self._resolve_effective_terminal_command_allowlist(
             user_config=_session_user_config,
             source=source,
@@ -4992,6 +4997,7 @@ class GatewayRunner:
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(
             context,
+            enabled_toolsets=_session_enabled_toolsets,
             terminal_command_allowlist=_terminal_command_allowlist,
         )
         
@@ -9205,6 +9211,7 @@ class GatewayRunner:
         self,
         context: SessionContext,
         *,
+        enabled_toolsets: Optional[list[str]] = None,
         terminal_command_allowlist: Optional[list[str]] = None,
     ) -> list:
         """Set session context variables for the current async task.
@@ -9222,8 +9229,10 @@ class GatewayRunner:
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
+            user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
+            enabled_toolsets=",".join(enabled_toolsets or []),
             terminal_command_allowlist=",".join(terminal_command_allowlist or []),
         )
 

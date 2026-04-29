@@ -426,6 +426,8 @@ def create_job(
     script: Optional[str] = None,
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
+    toolsets_inherited: bool = False,
+    owner: Optional[Dict[str, Any]] = None,
     workdir: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
@@ -531,7 +533,9 @@ def create_job(
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
+        "owner": owner,
         "enabled_toolsets": normalized_toolsets,
+        "toolsets_inherited": bool(toolsets_inherited),
         "workdir": normalized_workdir,
     }
 
@@ -574,6 +578,14 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["workdir"] = None
             else:
                 updates["workdir"] = _normalize_workdir(_wd)
+
+        if "enabled_toolsets" in updates:
+            raw_toolsets = updates["enabled_toolsets"]
+            updates["enabled_toolsets"] = (
+                [str(t).strip() for t in raw_toolsets if str(t).strip()]
+                if raw_toolsets
+                else None
+            ) or None
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

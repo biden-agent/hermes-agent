@@ -3,6 +3,7 @@
 import json
 import pytest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.cronjob_tools import (
     _scan_cron_prompt,
@@ -231,3 +232,167 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         assert updated["job"]["skills"] == []
         assert updated["job"]["skill"] is None
+
+    def test_gateway_user_only_lists_own_jobs(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        alice = json.loads(cronjob(action="create", prompt="Alice task", schedule="every 1h"))
+
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_bob")
+        bob = json.loads(cronjob(action="create", prompt="Bob task", schedule="every 1h"))
+
+        listing = json.loads(cronjob(action="list"))
+
+        assert listing["success"] is True
+        assert listing["count"] == 1
+        assert listing["jobs"][0]["job_id"] == bob["job_id"]
+        assert listing["jobs"][0]["job_id"] != alice["job_id"]
+
+    def test_gateway_user_name_collision_cannot_list_another_users_job(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Shared Name")
+        alice = json.loads(cronjob(action="create", prompt="Alice task", schedule="every 1h"))
+
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_bob")
+        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Shared Name")
+        bob = json.loads(cronjob(action="create", prompt="Bob task", schedule="every 1h"))
+
+        listing = json.loads(cronjob(action="list"))
+
+        assert listing["success"] is True
+        assert listing["count"] == 1
+        assert listing["jobs"][0]["job_id"] == bob["job_id"]
+        assert listing["jobs"][0]["job_id"] != alice["job_id"]
+
+    @pytest.mark.parametrize("action", ["update", "remove", "run", "pause", "resume"])
+    def test_gateway_user_cannot_manage_another_users_job(self, monkeypatch, action):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        created = json.loads(cronjob(action="create", prompt="Alice task", schedule="every 1h"))
+
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_bob")
+        kwargs = {"action": action, "job_id": created["job_id"]}
+        if action == "update":
+            kwargs["name"] = "Bob edit"
+
+        result = json.loads(cronjob(**kwargs))
+
+        assert result["success"] is False
+        assert "permission" in result["error"].lower()
+
+    @pytest.mark.parametrize("action", ["update", "remove", "run", "pause", "resume"])
+    def test_gateway_user_name_collision_cannot_manage_another_users_job(self, monkeypatch, action):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Shared Name")
+        created = json.loads(cronjob(action="create", prompt="Alice task", schedule="every 1h"))
+
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_bob")
+        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Shared Name")
+        kwargs = {"action": action, "job_id": created["job_id"]}
+        if action == "update":
+            kwargs["name"] = "Bob edit"
+
+        result = json.loads(cronjob(**kwargs))
+
+        assert result["success"] is False
+        assert "permission" in result["error"].lower()
+
+    @pytest.mark.parametrize(
+        "platform_cfg",
+        [
+            {"admins": ["ou_admin"]},
+            {"extra": {"admins": ["ou_admin"]}},
+        ],
+    )
+    def test_feishu_admin_can_list_and_manage_all_jobs_by_stable_id(self, monkeypatch, platform_cfg):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        alice = json.loads(cronjob(action="create", prompt="Alice task", schedule="every 1h"))
+
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_bob")
+        bob = json.loads(cronjob(action="create", prompt="Bob task", schedule="every 1h"))
+
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_admin")
+        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Friendly Admin")
+        with patch("hermes_cli.config.load_config", return_value={"platforms": {"feishu": platform_cfg}}):
+            listing = json.loads(cronjob(action="list"))
+            paused = json.loads(cronjob(action="pause", job_id=alice["job_id"]))
+            removed = json.loads(cronjob(action="remove", job_id=bob["job_id"]))
+
+        assert listing["count"] == 2
+        assert {job["job_id"] for job in listing["jobs"]} == {alice["job_id"], bob["job_id"]}
+        assert paused["success"] is True
+        assert removed["success"] is True
+
+    def test_feishu_admin_name_match_does_not_grant_admin_access(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        alice = json.loads(cronjob(action="create", prompt="Alice task", schedule="every 1h"))
+
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_bob")
+        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Configured Admin Name")
+        with patch("hermes_cli.config.load_config", return_value={"platforms": {"feishu": {"admins": ["Configured Admin Name"]}}}):
+            listing = json.loads(cronjob(action="list"))
+            paused = json.loads(cronjob(action="pause", job_id=alice["job_id"]))
+
+        assert listing["success"] is True
+        assert listing["count"] == 0
+        assert paused["success"] is False
+        assert "permission" in paused["error"].lower()
+
+    def test_create_stores_gateway_owner_and_inherited_toolsets(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        monkeypatch.setenv("HERMES_SESSION_USER_NAME", "Alice")
+        monkeypatch.setenv("HERMES_SESSION_ENABLED_TOOLSETS", "web,terminal,cronjob")
+
+        created = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+
+        from cron.jobs import get_job
+        job = get_job(created["job_id"])
+        assert job["owner"] == {
+            "platform": "feishu",
+            "user_id": "ou_alice",
+            "user_name": "Alice",
+        }
+        assert job["enabled_toolsets"] == ["web", "terminal"]
+
+    def test_non_admin_explicit_toolsets_are_limited_to_session_scope(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        monkeypatch.setenv("HERMES_SESSION_ENABLED_TOOLSETS", "web,terminal,cronjob")
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check",
+                schedule="every 1h",
+                enabled_toolsets=["web", "file"],
+            )
+        )
+
+        assert result["success"] is False
+        assert "enabled_toolsets" in result["error"]
+
+    def test_gateway_create_fails_closed_when_owner_toolsets_unresolved(self, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_PLATFORM", "feishu")
+        monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat")
+        monkeypatch.setenv("HERMES_SESSION_USER_ID", "ou_alice")
+        monkeypatch.delenv("HERMES_SESSION_ENABLED_TOOLSETS", raising=False)
+
+        with patch("tools.cronjob_tools._derive_platform_toolsets", return_value=None):
+            result = json.loads(cronjob(action="create", prompt="Check", schedule="every 1h"))
+
+        assert result["success"] is False
+        assert "enabled_toolsets" in result["error"]
+        assert "session scope" in result["error"]
