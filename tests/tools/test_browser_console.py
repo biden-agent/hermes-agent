@@ -194,6 +194,90 @@ class TestBrowserVisionAnnotate:
                 cmd_args = args[2] if len(args) > 2 else []
                 assert "--annotate" in cmd_args
 
+    def test_cdp_screenshot_clip_uses_css_dimensions_without_doubling_dpr(self):
+        """CDP full-page capture clips in CSS px and does not double DPR."""
+        from tools.browser_tool import _build_cdp_screenshot_clip
+
+        clip = _build_cdp_screenshot_clip(
+            {
+                "innerWidth": 1200,
+                "devicePixelRatio": 2,
+                "scrollWidth": 1200,
+                "scrollHeight": 6478,
+            }
+        )
+
+        assert clip == {
+            "x": 0,
+            "y": 0,
+            "width": 1200,
+            "height": 6478,
+            "scale": 1,
+        }
+        assert clip["width"] != 4800
+
+    def test_cdp_browser_vision_does_not_call_agent_browser_full(self, tmp_path):
+        """CDP-backed, non-annotated vision uses direct CDP capture instead of --full."""
+        from tools.browser_tool import browser_vision
+
+        shots_dir = tmp_path / "browser_screenshots"
+        shots_dir.mkdir()
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "CDP screenshot analysis"
+        mock_response.choices = [mock_choice]
+
+        def fake_capture(_endpoint, screenshot_path):
+            screenshot_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8)
+            return {"success": True, "path": str(screenshot_path)}
+
+        with (
+            patch("hermes_constants.get_hermes_dir", return_value=shots_dir),
+            patch("tools.browser_tool._cleanup_old_screenshots"),
+            patch(
+                "tools.browser_tool._get_cdp_screenshot_endpoint",
+                return_value="ws://example/devtools/browser/1",
+            ),
+            patch(
+                "tools.browser_tool._capture_cdp_screenshot",
+                side_effect=fake_capture,
+            ) as mock_cdp_capture,
+            patch("tools.browser_tool._run_browser_command") as mock_cmd,
+            patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+            patch("tools.browser_tool.call_llm", return_value=mock_response),
+        ):
+            result = json.loads(browser_vision("what is on the page?", task_id="test"))
+
+        assert result["success"] is True
+        assert result["analysis"] == "CDP screenshot analysis"
+        mock_cdp_capture.assert_called_once()
+        mock_cmd.assert_not_called()
+
+    def test_annotate_true_uses_agent_browser_fallback_with_annotate(self):
+        """Annotated screenshots keep using agent-browser so annotation data is preserved."""
+        from tools.browser_tool import browser_vision
+
+        with (
+            patch(
+                "tools.browser_tool._get_cdp_screenshot_endpoint",
+                return_value="ws://example/devtools/browser/1",
+            ),
+            patch("tools.browser_tool._capture_cdp_screenshot") as mock_cdp_capture,
+            patch("tools.browser_tool._run_browser_command") as mock_cmd,
+            patch("tools.browser_tool.call_llm"),
+            patch("tools.browser_tool._get_vision_model", return_value="test-model"),
+        ):
+            mock_cmd.return_value = {"success": True, "data": {}}
+            try:
+                browser_vision("test", annotate=True, task_id="test")
+            except Exception:
+                pass
+
+        mock_cdp_capture.assert_not_called()
+        cmd_args = mock_cmd.call_args[0][2]
+        assert "--annotate" in cmd_args
+        assert "--full" in cmd_args
+
 
 class TestBrowserVisionConfig:
     def _setup_screenshot(self, tmp_path):

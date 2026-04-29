@@ -4851,8 +4851,13 @@ def _failure_messages(url: str, port: int, system: str) -> list[str]:
     from hermes_cli.browser_connect import manual_chrome_debug_command
 
     command = manual_chrome_debug_command(port, system)
+    executable_note = (
+        ["No Chrome/Chromium executable was found in this environment."]
+        if command and command.startswith("open -a ")
+        else []
+    )
     hint = (
-        ["Start Chrome with remote debugging, then retry /browser connect:", command]
+        [*executable_note, "Start Chrome with remote debugging, then retry /browser connect:", command]
         if command
         else [
             "No Chrome/Chromium executable was found in this environment.",

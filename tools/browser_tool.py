@@ -65,6 +65,8 @@ import time
 import requests
 from typing import Dict, Any, Optional, List, Tuple
 from pathlib import Path
+from urllib.parse import urlparse
+from urllib.request import urlopen
 from agent.auxiliary_client import call_llm
 from hermes_constants import get_hermes_home
 from utils import is_truthy_value
@@ -289,6 +291,144 @@ def _get_cdp_override() -> str:
     return ""
 
 
+def _configured_browser_cdp_url() -> str:
+    env_override = os.environ.get("BROWSER_CDP_URL", "").strip()
+    if env_override:
+        return env_override
+
+    try:
+        from hermes_cli.config import read_raw_config
+
+        cfg = read_raw_config()
+        browser_cfg = cfg.get("browser", {}) if isinstance(cfg, dict) else {}
+        if isinstance(browser_cfg, dict):
+            return str(browser_cfg.get("cdp_url", "") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def _browser_connect_probe_urls(parsed) -> list[str]:
+    scheme = {"ws": "http", "wss": "https"}.get(parsed.scheme, parsed.scheme)
+    root = f"{scheme}://{parsed.netloc}".rstrip("/")
+    return [f"{root}/json/version", f"{root}/json"]
+
+
+def _browser_connect_http_ok(url: str, timeout: float) -> bool:
+    try:
+        with urlopen(url, timeout=timeout) as response:
+            return 200 <= getattr(response, "status", 200) < 300
+    except Exception:
+        return False
+
+
+def _is_default_local_cdp(parsed) -> bool:
+    try:
+        port = parsed.port or 80
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "ws"}
+        and parsed.hostname in {"127.0.0.1", "localhost"}
+        and port == 9222
+        and parsed.path in {"", "/", "/json", "/json/version"}
+    )
+
+
+def _normalize_browser_connect_url(parsed) -> str:
+    if parsed.path.startswith("/devtools/browser/"):
+        return parsed.geturl()
+    return parsed._replace(path="", params="", query="", fragment="").geturl()
+
+
+def _browser_connect_tcp_ok(host: str, port: int, timeout: float) -> bool:
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_browser_cdp_connected() -> Dict[str, Any]:
+    """Validate or lazily launch the configured/default browser CDP endpoint.
+
+    Chat input never controls executable paths or launch arguments here. Local
+    launch is limited to the default loopback endpoint and delegates Chrome
+    candidate selection to ``hermes_cli.browser_connect``.
+    Remote endpoints are only validated; they are never launched locally.
+    """
+    from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL, try_launch_chrome_debug
+
+    raw_url = _configured_browser_cdp_url() or DEFAULT_BROWSER_CDP_URL
+    parsed = urlparse(raw_url if "://" in raw_url else f"http://{raw_url}")
+    if parsed.scheme not in {"http", "https", "ws", "wss"}:
+        return {"success": False, "connected": False, "error": f"unsupported browser url: {raw_url}"}
+    if not parsed.hostname:
+        return {"success": False, "connected": False, "error": f"missing host in browser url: {raw_url}"}
+    try:
+        port = parsed.port or (443 if parsed.scheme in {"https", "wss"} else 80)
+    except ValueError:
+        return {"success": False, "connected": False, "error": f"invalid port in browser url: {raw_url}"}
+
+    if _is_default_local_cdp(parsed):
+        raw_url = DEFAULT_BROWSER_CDP_URL
+        parsed = urlparse(raw_url)
+        port = parsed.port or 9222
+
+    launched = False
+    if parsed.scheme in {"ws", "wss"} and parsed.path.startswith("/devtools/browser/"):
+        ok = _browser_connect_tcp_ok(parsed.hostname, port, 2.0)
+    else:
+        probes = _browser_connect_probe_urls(parsed)
+        ok = any(_browser_connect_http_ok(url, 2.0) for url in probes)
+        if not ok and _is_default_local_cdp(parsed):
+            import platform
+
+            if try_launch_chrome_debug(port, platform.system()):
+                launched = True
+                for _ in range(20):
+                    time.sleep(0.5)
+                    if any(_browser_connect_http_ok(url, 1.0) for url in probes):
+                        ok = True
+                        break
+
+    if not ok:
+        return {
+            "success": False,
+            "connected": False,
+            "launched": launched,
+            "error": f"could not reach browser CDP at {raw_url}",
+        }
+
+    normalized = _normalize_browser_connect_url(parsed)
+    os.environ["BROWSER_CDP_URL"] = normalized
+    return {"success": True, "connected": True, "url": normalized, "launched": launched}
+
+
+def browser_connect(task_id: Optional[str] = None) -> str:
+    """Explicitly connect browser tools to configured/default Chrome CDP.
+
+    This tool intentionally accepts no executable path or launch arguments; the
+    only local process it can launch is the detected Chrome candidate selected
+    by ``hermes_cli.browser_connect.try_launch_chrome_debug``.
+    """
+    result = _ensure_browser_cdp_connected()
+    if not result.get("success"):
+        return tool_error(
+            result.get("error", "could not reach browser CDP"),
+            connected=False,
+            launched=result.get("launched", False),
+            success=False,
+        )
+
+    cleanup_all_browsers()
+    if task_id:
+        _ensure_cdp_supervisor(task_id)
+    return tool_result(connected=True, url=result["url"], launched=result.get("launched", False))
+
+
 def _get_dialog_policy_config() -> Tuple[str, float]:
     """Read ``browser.dialog_policy`` + ``browser.dialog_timeout_s`` from config.
 
@@ -371,6 +511,128 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
             task_id,
             exc,
         )
+
+
+def _get_cdp_screenshot_endpoint(task_id: str) -> str:
+    """Return a CDP WebSocket endpoint suitable for direct screenshot capture."""
+    endpoint = _get_cdp_override()
+    if endpoint:
+        return endpoint
+
+    with _cleanup_lock:
+        session_info = _active_sessions.get(task_id, {})
+    maybe = str(session_info.get("cdp_url") or "").strip()
+    if maybe:
+        return _resolve_cdp_override(maybe)
+    return ""
+
+
+def _build_cdp_screenshot_clip(metrics: Dict[str, Any]) -> Dict[str, float]:
+    """Build a CSS-pixel CDP screenshot clip without double-applying DPR."""
+    def _positive_number(value: Any, default: float) -> float:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return default
+        return number if number > 0 else default
+
+    width = max(
+        _positive_number(metrics.get("scrollWidth"), 0),
+        _positive_number(metrics.get("innerWidth"), 0),
+        1,
+    )
+    height = max(
+        _positive_number(metrics.get("scrollHeight"), 0),
+        _positive_number(metrics.get("innerHeight"), 0),
+        1,
+    )
+    return {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
+
+
+def _select_cdp_page_target(targets: List[Dict[str, Any]]) -> str:
+    """Choose the active page target from Target.getTargets output."""
+    pages = [t for t in targets if t.get("type") == "page" and t.get("targetId")]
+    if not pages:
+        raise RuntimeError("CDP did not report any page targets")
+    for target in pages:
+        url = str(target.get("url") or "")
+        if not url.startswith("devtools://"):
+            return str(target["targetId"])
+    return str(pages[0]["targetId"])
+
+
+async def _capture_cdp_screenshot_async(endpoint: str, screenshot_path: Path, timeout: float) -> Dict[str, Any]:
+    from tools.browser_cdp_tool import _cdp_call
+
+    metrics_expression = """
+JSON.stringify({
+  innerWidth: window.innerWidth,
+  innerHeight: window.innerHeight,
+  devicePixelRatio: window.devicePixelRatio || 1,
+  scrollWidth: Math.max(
+    document.documentElement.scrollWidth || 0,
+    document.body ? document.body.scrollWidth || 0 : 0,
+    window.innerWidth || 0
+  ),
+  scrollHeight: Math.max(
+    document.documentElement.scrollHeight || 0,
+    document.body ? document.body.scrollHeight || 0 : 0,
+    window.innerHeight || 0
+  )
+})
+""".strip()
+
+    target_result = await _cdp_call(endpoint, "Target.getTargets", {}, None, timeout)
+    target_id = _select_cdp_page_target(target_result.get("targetInfos", []) or [])
+    metrics_result = await _cdp_call(
+        endpoint,
+        "Runtime.evaluate",
+        {
+            "expression": metrics_expression,
+            "returnByValue": True,
+        },
+        target_id,
+        timeout,
+    )
+    raw_metrics = metrics_result.get("result", {}).get("value") or "{}"
+    try:
+        metrics = json.loads(raw_metrics) if isinstance(raw_metrics, str) else raw_metrics
+    except json.JSONDecodeError:
+        metrics = {}
+    clip = _build_cdp_screenshot_clip(metrics if isinstance(metrics, dict) else {})
+    screenshot_result = await _cdp_call(
+        endpoint,
+        "Page.captureScreenshot",
+        {
+            "format": "png",
+            "fromSurface": True,
+            "captureBeyondViewport": True,
+            "clip": clip,
+        },
+        target_id,
+        timeout,
+    )
+    data = screenshot_result.get("data")
+    if not data:
+        raise RuntimeError("CDP Page.captureScreenshot returned no image data")
+
+    import base64
+
+    screenshot_path.write_bytes(base64.b64decode(data))
+    return {
+        "success": True,
+        "path": str(screenshot_path),
+        "clip": clip,
+        "target_id": target_id,
+    }
+
+
+def _capture_cdp_screenshot(endpoint: str, screenshot_path: Path) -> Dict[str, Any]:
+    """Capture a full-page screenshot through CDP using explicit CSS clipping."""
+    from tools.browser_cdp_tool import _run_async
+
+    timeout = max(float(_get_command_timeout()), 5.0)
+    return _run_async(_capture_cdp_screenshot_async(endpoint, screenshot_path, timeout))
 
 
 def _stop_cdp_supervisor(task_id: str) -> None:
@@ -984,6 +1246,14 @@ def _update_session_activity(task_id: str):
         _session_last_activity[task_id] = time.time()
 
 
+def _should_ensure_cdp_for_task(task_id: str, provider: Any = None) -> tuple[bool, Any]:
+    if _configured_browser_cdp_url():
+        return True, provider
+    if provider is None:
+        provider = _get_cloud_provider()
+    return False, provider
+
+
 # Register cleanup thread stop on exit
 atexit.register(_stop_browser_cleanup_thread)
 
@@ -993,6 +1263,15 @@ atexit.register(_stop_browser_cleanup_thread)
 # ============================================================================
 
 BROWSER_TOOL_SCHEMAS = [
+    {
+        "name": "browser_connect",
+        "description": "Explicitly connect browser tools to the configured Chrome DevTools Protocol endpoint. If no endpoint is configured, uses the default local Chrome debug endpoint at 127.0.0.1:9222 and may launch a detected local Chrome/Chromium candidate. Accepts no executable path, command-line arguments, or user-provided launch options.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    },
     {
         "name": "browser_navigate",
         "description": "Navigate to a URL in the browser. Initializes the session and loads the page. Must be called before other browser tools. For simple information retrieval, prefer web_search or web_extract (faster, cheaper). For plain-text endpoints — URLs ending in .md, .txt, .json, .yaml, .yml, .csv, .xml, raw.githubusercontent.com, or any documented API endpoint — prefer curl via the terminal tool or web_extract; the browser stack is overkill and much slower for these. Use browser tools when you need to interact with a page (click, fill forms, dynamic content). Returns a compact page snapshot with interactive elements and ref IDs — no need to call browser_snapshot separately after navigating.",
@@ -1211,6 +1490,12 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     # the bare task_id key.
     force_local = _is_local_sidecar_key(task_id)
 
+    should_ensure_cdp, provider = _should_ensure_cdp_for_task(task_id)
+    if should_ensure_cdp:
+        connect_result = _ensure_browser_cdp_connected()
+        if not connect_result.get("success"):
+            raise RuntimeError(connect_result.get("error", "could not reach browser CDP"))
+
     # Create session outside the lock (network call in cloud mode)
     cdp_override = _get_cdp_override()
     if cdp_override and not force_local:
@@ -1218,7 +1503,8 @@ def _get_session_info(task_id: Optional[str] = None) -> Dict[str, str]:
     elif force_local:
         session_info = _create_local_session(task_id)
     else:
-        provider = _get_cloud_provider()
+        if provider is None:
+            provider = _get_cloud_provider()
         if provider is None:
             session_info = _create_local_session(task_id)
         else:
@@ -1401,6 +1687,22 @@ def _run_browser_command(
         logger.warning("browser command blocked on Termux: %s", error)
         return {"success": False, "error": error}
 
+    from tools.interrupt import is_interrupted
+    if is_interrupted():
+        return {"success": False, "error": "Interrupted"}
+
+    with _cleanup_lock:
+        has_session = task_id in _active_sessions
+    if not has_session:
+        should_ensure_cdp, _ = _should_ensure_cdp_for_task(task_id)
+        if should_ensure_cdp:
+            connect_result = _ensure_browser_cdp_connected()
+            if not connect_result.get("success"):
+                return {
+                    "success": False,
+                    "error": connect_result.get("error", "could not reach browser CDP"),
+                }
+
     # Local mode with no Chromium on disk: fail fast with an actionable
     # message instead of hanging for _command_timeout seconds per call.
     if _is_local_mode() and not _chromium_installed():
@@ -1418,10 +1720,6 @@ def _run_browser_command(
             )
         logger.warning("browser command blocked: %s", hint)
         return {"success": False, "error": hint}
-    
-    from tools.interrupt import is_interrupted
-    if is_interrupted():
-        return {"success": False, "error": "Interrupted"}
 
     # Get session info (creates Browserbase session with proxies if needed)
     try:
@@ -2383,17 +2681,23 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Prune old screenshots (older than 24 hours) to prevent unbounded disk growth
         _cleanup_old_screenshots(screenshots_dir, max_age_hours=24)
         
-        # Take screenshot using agent-browser
-        screenshot_args = []
-        if annotate:
-            screenshot_args.append("--annotate")
-        screenshot_args.append("--full")
-        screenshot_args.append(str(screenshot_path))
-        result = _run_browser_command(
-            effective_task_id, 
-            "screenshot", 
-            screenshot_args,
-        )
+        # CDP-backed full-page screenshots need explicit CSS clipping. The
+        # agent-browser --full path can double-apply deviceScaleFactor on some
+        # external/local CDP sessions, yielding blank right halves.
+        cdp_endpoint = "" if annotate else _get_cdp_screenshot_endpoint(effective_task_id)
+        if cdp_endpoint:
+            result = _capture_cdp_screenshot(cdp_endpoint, screenshot_path)
+        else:
+            screenshot_args = []
+            if annotate:
+                screenshot_args.append("--annotate")
+            screenshot_args.append("--full")
+            screenshot_args.append(str(screenshot_path))
+            result = _run_browser_command(
+                effective_task_id,
+                "screenshot",
+                screenshot_args,
+            )
         
         if not result.get("success"):
             error_detail = result.get("error", "Unknown error")
@@ -2903,10 +3207,18 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry, tool_error
+from tools.registry import registry, tool_error, tool_result
 
 _BROWSER_SCHEMA_MAP = {s["name"]: s for s in BROWSER_TOOL_SCHEMAS}
 
+registry.register(
+    name="browser_connect",
+    toolset="browser",
+    schema=_BROWSER_SCHEMA_MAP["browser_connect"],
+    handler=lambda args, **kw: browser_connect(task_id=kw.get("task_id")),
+    check_fn=check_browser_requirements,
+    emoji="🌐",
+)
 registry.register(
     name="browser_navigate",
     toolset="browser",
