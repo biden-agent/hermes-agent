@@ -84,6 +84,7 @@ AUTHOR_MAP = {
     "6548898+romanornr@users.noreply.github.com": "romanornr",
     "foxion37@gmail.com": "foxion37",
     "bloodcarter@gmail.com": "bloodcarter",
+    "scott@scotttrinh.com": "scotttrinh",
     # contributors (from noreply pattern)
     "david.vv@icloud.com": "davidvv",
     "wangqiang@wangqiangdeMac-mini.local": "xiaoqiang243",
@@ -260,6 +261,7 @@ AUTHOR_MAP = {
     "154585401+LeonSGP43@users.noreply.github.com": "LeonSGP43",
     "mgparkprint@gmail.com": "vlwkaos",
     "tranquil_flow@protonmail.com": "Tranquil-Flow",
+    "LyleLengyel@gmail.com": "mcndjxlefnd",
     "wangshengyang2004@163.com": "Wangshengyang2004",
     "hasan.ali13381@gmail.com": "H-Ali13381",
     "xienb@proton.me": "XieNBi",
@@ -411,6 +413,7 @@ AUTHOR_MAP = {
     "tesseracttars@gmail.com": "tesseracttars-creator",
     "tianliangjay@gmail.com": "xingkongliang",
     "tranquil_flow@protonmail.com": "Tranquil-Flow",
+    "LyleLengyel@gmail.com": "mcndjxlefnd",
     "unayung@gmail.com": "Unayung",
     "vorvul.danylo@gmail.com": "WorldInnovationsDepartment",
     "win4r@outlook.com": "win4r",
@@ -587,6 +590,10 @@ AUTHOR_MAP = {
     "jas9000@gmail.com": "twozle",
     "r.filgueiras@apheris.com": "rfilgueiras",
     "leihaibo1992@gmail.com": "Leihb",
+    # ACP streaming fix salvage (PR #9428 + #16273)
+    "nfb0408@163.com": "ningfangbin",
+    "164839249+Joseph19820124@users.noreply.github.com": "Joseph19820124",
+    "rugved@lmstudio.ai": "rugvedS07",
 }
 
 

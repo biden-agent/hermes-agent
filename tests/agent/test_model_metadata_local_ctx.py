@@ -275,13 +275,15 @@ class TestQueryLocalContextLengthLmStudio:
         return client_mock
 
     def test_lmstudio_exact_key_match(self):
-        """Reads max_context_length when key matches exactly."""
+        """Resolves loaded ctx when key matches exactly."""
         from agent.model_metadata import _query_local_context_length
 
         native_resp = self._make_resp(200, {
             "models": [
-                {"key": "nvidia/nvidia-nemotron-super-49b-v1", "id": "nvidia/nvidia-nemotron-super-49b-v1",
-                 "max_context_length": 131072},
+                {"key": "nvidia/nvidia-nemotron-super-49b-v1",
+                 "id": "nvidia/nvidia-nemotron-super-49b-v1",
+                 "max_context_length": 1_048_576,
+                 "loaded_instances": [{"config": {"context_length": 131072}}]},
             ]
         })
         client_mock = self._make_client(
@@ -311,7 +313,8 @@ class TestQueryLocalContextLengthLmStudio:
             "models": [
                 {"key": "nvidia/nvidia-nemotron-super-49b-v1",
                  "id": "nvidia/nvidia-nemotron-super-49b-v1",
-                 "max_context_length": 131072},
+                 "max_context_length": 1_048_576,
+                 "loaded_instances": [{"config": {"context_length": 131072}}]},
             ]
         })
         client_mock = self._make_client(
@@ -464,7 +467,10 @@ class TestFetchEndpointModelMetadataLmStudio:
                     {
                         "key": "lmstudio-community/Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf",
                         "id": "lmstudio-community/Qwen3.5-27B-GGUF/Qwen3.5-27B-Q8_0.gguf",
-                        "max_context_length": 131072,
+                        "max_context_length": 1_048_576,
+                        "loaded_instances": [
+                            {"config": {"context_length": 131072}}
+                        ],
                     }
                 ]
             }
