@@ -436,6 +436,8 @@ class FeishuGroupMessageCacheEntry:
     user_id: Optional[str]
     open_id: Optional[str]
     union_id: Optional[str]
+    media_urls: tuple[str, ...] = ()
+    media_types: tuple[str, ...] = ()
 
 
 # ---------------------------------------------------------------------------
@@ -2346,6 +2348,30 @@ class FeishuAdapter(BasePlatformAdapter):
     def _group_history_sender_label(entry: FeishuGroupMessageCacheEntry) -> str:
         return entry.sender_name or entry.user_id or entry.open_id or entry.union_id or "unknown"
 
+    @staticmethod
+    def _group_history_media_label(media_type: str) -> str:
+        normalized = (media_type or "").lower()
+        if normalized.startswith("image/"):
+            return "image"
+        if normalized.startswith("audio/"):
+            return "audio"
+        if normalized.startswith("video/"):
+            return "video"
+        return "document"
+
+    def _group_history_entry_text(self, entry: FeishuGroupMessageCacheEntry) -> str:
+        rendered = (entry.text or "").strip()
+        media_notes: List[str] = []
+        for idx, path in enumerate(entry.media_urls):
+            media_type = entry.media_types[idx] if idx < len(entry.media_types) else ""
+            media_label = self._group_history_media_label(media_type)
+            display_name = self._display_name_from_cached_path(path)
+            media_notes.append(f"[Attached {media_label}: '{display_name}' saved at {path}]")
+        if not media_notes:
+            return rendered
+        media_text = " ".join(media_notes)
+        return f"{rendered} {media_text}".strip()
+
     def _append_group_message_history(self, entry: FeishuGroupMessageCacheEntry) -> None:
         history_map = getattr(self, "_group_message_history", None)
         if history_map is None:
@@ -2401,7 +2427,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return ""
         lines = ["[Previous group messages]"]
         for idx, entry in enumerate(prior[-self._group_history_inject_count:], start=1):
-            lines.append(f"{idx}. {self._group_history_sender_label(entry)}: {entry.text}")
+            lines.append(f"{idx}. {self._group_history_sender_label(entry)}: {self._group_history_entry_text(entry)}")
         return "\n".join(lines)
 
     async def _cache_group_message(
@@ -2423,6 +2449,8 @@ class FeishuAdapter(BasePlatformAdapter):
             user_id=sender_profile.get("user_id"),
             open_id=getattr(sender_id, "open_id", None) or None,
             union_id=getattr(sender_id, "union_id", None) or None,
+            media_urls=tuple(media_urls),
+            media_types=tuple(media_types),
         )
         self._append_group_message_history(entry)
         return text, inbound_type, media_urls, media_types, mentions, sender_profile

@@ -1401,6 +1401,89 @@ class TestAdapterBehavior(unittest.TestCase):
             "please help with deploy",
         )
 
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_group_mention_injects_cached_pdf_path_from_prior_unmentioned_file(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"group_history_inject_count": 3}))
+        adapter._bot_open_id = "ou_bot"
+        adapter._dispatch_inbound_event = AsyncMock()
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter._download_feishu_message_resource = AsyncMock(
+            return_value=("/tmp/doc_123_report.pdf", "application/pdf")
+        )
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Reading Group", "type": "group"}
+        )
+
+        profiles = {
+            "ou_alice": {"user_id": "u_alice", "user_name": "Alice", "user_id_alt": "on_alice"},
+            "ou_dana": {"user_id": "u_dana", "user_name": "Dana", "user_id_alt": "on_dana"},
+        }
+
+        async def _resolve(sender_id):
+            return profiles[sender_id.open_id]
+
+        adapter._resolve_sender_profile = AsyncMock(side_effect=_resolve)
+
+        def _event(*, sender_open_id, message_id, message_type, content, mentions):
+            message = SimpleNamespace(
+                message_id=message_id,
+                chat_type="group",
+                chat_id="oc_group",
+                thread_id=None,
+                parent_id=None,
+                upper_message_id=None,
+                message_type=message_type,
+                content=content,
+                mentions=mentions,
+            )
+            sender_id = SimpleNamespace(
+                open_id=sender_open_id,
+                user_id=profiles[sender_open_id]["user_id"],
+                union_id=profiles[sender_open_id]["user_id_alt"],
+            )
+            return SimpleNamespace(
+                event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id))
+            )
+
+        pdf = _event(
+            sender_open_id="ou_alice",
+            message_id="om_pdf",
+            message_type="file",
+            content=json.dumps({"file_key": "file_doc", "file_name": "report.pdf"}),
+            mentions=[],
+        )
+        mentioned = _event(
+            sender_open_id="ou_dana",
+            message_id="om_ask",
+            message_type="text",
+            content=json.dumps({"text": "@_user_1 读一下刚才这篇论文"}, ensure_ascii=False),
+            mentions=[
+                SimpleNamespace(
+                    key="@_user_1",
+                    name="Hermes",
+                    id=SimpleNamespace(open_id="ou_bot", user_id="u_bot"),
+                )
+            ],
+        )
+
+        async def _run() -> None:
+            await adapter._handle_message_event_data(pdf)
+            await adapter._handle_message_event_data(mentioned)
+
+        asyncio.run(_run())
+
+        adapter._dispatch_inbound_event.assert_awaited_once()
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(
+            event.text,
+            "[Previous group messages]\n"
+            "1. Alice: [Attachment] [Attached document: 'report.pdf' saved at /tmp/doc_123_report.pdf]\n\n"
+            "读一下刚才这篇论文",
+        )
+
     def test_group_history_includes_marked_bot_response(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
