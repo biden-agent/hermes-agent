@@ -18,6 +18,7 @@ Method reference: https://chromedevtools.github.io/devtools-protocol/
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from typing import Any, Dict, Optional
@@ -109,13 +110,17 @@ async def _cdp_call(
     """
     assert websockets is not None  # guarded by _WS_AVAILABLE at call-site
 
-    async with websockets.connect(
+    connect_result = websockets.connect(
         ws_url,
         max_size=None,  # CDP responses (e.g. DOM.getDocument) can be large
         open_timeout=timeout,
         close_timeout=5,
         ping_interval=None,  # CDP server doesn't expect pings
-    ) as ws:
+    )
+    if inspect.isawaitable(connect_result):
+        connect_result = await connect_result
+
+    async with connect_result as ws:
         next_id = 1
         session_id: Optional[str] = None
 

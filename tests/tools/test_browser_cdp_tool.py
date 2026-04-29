@@ -228,6 +228,51 @@ def test_browser_level_success(cdp_server):
     assert "sessionId" not in calls[0]
 
 
+def test_cdp_call_supports_async_connect_factory(monkeypatch):
+    """Regression: websockets.connect may be an async factory for the CM."""
+
+    class FakeWebSocket:
+        def __init__(self):
+            self.sent: List[Dict[str, Any]] = []
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def send(self, raw: str):
+            self.sent.append(json.loads(raw))
+
+        async def recv(self):
+            return json.dumps(
+                {
+                    "id": self.sent[-1]["id"],
+                    "result": {"targetInfos": []},
+                }
+            )
+
+    fake_ws = FakeWebSocket()
+
+    async def fake_connect(*args, **kwargs):
+        return fake_ws
+
+    monkeypatch.setattr(browser_cdp_tool.websockets, "connect", fake_connect)
+
+    result = browser_cdp_tool._run_async(
+        browser_cdp_tool._cdp_call(
+            "ws://example/devtools/browser/mock",
+            "Target.getTargets",
+            {},
+            None,
+            1.0,
+        )
+    )
+
+    assert result == {"targetInfos": []}
+    assert fake_ws.sent[0]["method"] == "Target.getTargets"
+
+
 def test_empty_params_sends_empty_object(cdp_server):
     cdp_server.on("Browser.getVersion", lambda params, sid: {"product": "Mock/1.0"})
     json.loads(browser_cdp_tool.browser_cdp(method="Browser.getVersion"))
