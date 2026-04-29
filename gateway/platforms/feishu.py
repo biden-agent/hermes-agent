@@ -2612,12 +2612,15 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
-        """Fetch the reacted-to message; if it was sent by this bot, emit a synthetic text event."""
+        """Fetch the reacted-to message; if Hermes sent it, emit a synthetic text event."""
         if not self._client:
             return
         event = getattr(data, "event", None)
         message_id = str(getattr(event, "message_id", "") or "")
         if not message_id:
+            return
+        tracked_chat_id = self._sent_message_ids_to_chat.get(message_id)
+        if not tracked_chat_id:
             return
 
         # Fetch the target message to verify it was sent by us and to obtain chat context.
@@ -2637,6 +2640,8 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_id = str(getattr(msg, "chat_id", "") or "")
             chat_type_raw = str(getattr(msg, "chat_type", "p2p") or "p2p")
             if not chat_id:
+                chat_id = tracked_chat_id
+            elif chat_id != tracked_chat_id:
                 return
         except Exception:
             logger.debug("[Feishu] Failed to fetch message for reaction routing", exc_info=True)
@@ -4234,6 +4239,22 @@ class FeishuAdapter(BasePlatformAdapter):
         msg = getattr(response, "msg", default_message)
         return SendResult(success=False, error=f"[{code}] {msg}", raw_response=response)
 
+    def _remember_sent_message_id(self, message_id: Any, chat_id: Any) -> None:
+        message_id = str(message_id or "").strip()
+        chat_id = str(chat_id or "").strip()
+        if not message_id or not chat_id:
+            return
+        if message_id in self._sent_message_ids_to_chat:
+            try:
+                self._sent_message_id_order.remove(message_id)
+            except ValueError:
+                pass
+        self._sent_message_ids_to_chat[message_id] = chat_id
+        self._sent_message_id_order.append(message_id)
+        while len(self._sent_message_id_order) > _FEISHU_BOT_MSG_TRACK_SIZE:
+            evicted = self._sent_message_id_order.pop(0)
+            self._sent_message_ids_to_chat.pop(evicted, None)
+
     def _finalize_send_result(self, response: Any, default_message: str) -> SendResult:
         if not self._response_succeeded(response):
             return self._response_error_result(response, default_message=default_message)
@@ -4364,6 +4385,11 @@ class FeishuAdapter(BasePlatformAdapter):
                             reply_to=None,
                             metadata=metadata,
                         )
+                if self._response_succeeded(response):
+                    self._remember_sent_message_id(
+                        self._extract_response_field(response, "message_id"),
+                        chat_id,
+                    )
                 return response
             except Exception as exc:
                 last_error = exc

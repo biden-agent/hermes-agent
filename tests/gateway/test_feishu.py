@@ -749,6 +749,125 @@ class TestAdapterBehavior(unittest.TestCase):
             adapter._on_reaction_event("im.message.reaction.created_v1", data)
         run_threadsafe.assert_called_once()
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_reaction_on_untracked_app_card_is_ignored(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(
+                        get=Mock(
+                            return_value=SimpleNamespace(
+                                success=lambda: True,
+                                data=SimpleNamespace(
+                                    items=[
+                                        SimpleNamespace(
+                                            sender=SimpleNamespace(sender_type="app"),
+                                            chat_id="oc_alerts",
+                                            chat_type="group",
+                                        )
+                                    ]
+                                ),
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        adapter._build_get_message_request = Mock(return_value=object())
+        adapter._handle_message_with_guards = AsyncMock()
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "Alice", "user_id_alt": None}
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Alerts", "type": "group"})
+
+        event = SimpleNamespace(
+            message_id="om_x100b502e04c4eca0e12f8cab4483472",
+            user_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id=None),
+            reaction_type=SimpleNamespace(emoji_type="Get"),
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(
+                adapter._handle_reaction_event(
+                    "im.message.reaction.created_v1",
+                    SimpleNamespace(event=event),
+                )
+            )
+
+        adapter._handle_message_with_guards.assert_not_awaited()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_reaction_on_tracked_app_message_is_routed(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._sent_message_ids_to_chat["om_bot_message"] = "oc_alerts"
+        adapter._client = SimpleNamespace(
+            im=SimpleNamespace(
+                v1=SimpleNamespace(
+                    message=SimpleNamespace(
+                        get=Mock(
+                            return_value=SimpleNamespace(
+                                success=lambda: True,
+                                data=SimpleNamespace(
+                                    items=[
+                                        SimpleNamespace(
+                                            sender=SimpleNamespace(sender_type="app"),
+                                            chat_id="oc_alerts",
+                                            chat_type="group",
+                                        )
+                                    ]
+                                ),
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        adapter._build_get_message_request = Mock(return_value=object())
+        adapter._handle_message_with_guards = AsyncMock()
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "Alice", "user_id_alt": "on_union"}
+        )
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Alerts", "type": "group"})
+
+        event = SimpleNamespace(
+            message_id="om_bot_message",
+            user_id=SimpleNamespace(open_id="ou_user", user_id=None, union_id="on_union"),
+            reaction_type=SimpleNamespace(emoji_type="Get"),
+        )
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            asyncio.run(
+                adapter._handle_reaction_event(
+                    "im.message.reaction.created_v1",
+                    SimpleNamespace(event=event),
+                )
+            )
+
+        adapter._handle_message_with_guards.assert_awaited_once()
+        synthetic_event = adapter._handle_message_with_guards.await_args.args[0]
+        self.assertEqual(synthetic_event.text, "reaction:added:Get")
+        self.assertEqual(synthetic_event.message_id, "om_bot_message")
+        self.assertEqual(synthetic_event.message_type.value, "text")
+        self.assertEqual(synthetic_event.source.chat_id, "oc_alerts")
+        self.assertEqual(synthetic_event.source.chat_name, "Alerts")
+        self.assertEqual(synthetic_event.source.chat_type, "group")
+        self.assertEqual(synthetic_event.source.user_id, "ou_user")
+        self.assertEqual(synthetic_event.source.user_name, "Alice")
+        self.assertEqual(synthetic_event.source.user_id_alt, "on_union")
+
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_requires_mentions_even_when_policy_open(self):
         from gateway.config import PlatformConfig
@@ -2169,6 +2288,7 @@ class TestAdapterBehavior(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertEqual(result.message_id, "om_reply")
+        self.assertEqual(adapter._sent_message_ids_to_chat["om_reply"], "oc_chat")
         self.assertTrue(captured["request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
