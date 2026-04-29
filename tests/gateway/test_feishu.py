@@ -1504,6 +1504,123 @@ class TestAdapterBehavior(unittest.TestCase):
             "second ask",
         )
 
+    def test_text_batch_does_not_merge_different_senders_in_shared_group(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import MessageEvent
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"group_sessions_per_user": False})
+        )
+        adapter._schedule_text_batch_flush = Mock()
+        adapter._handle_message_with_guards = AsyncMock()
+
+        def _source(user_id: str, union_id: str) -> SessionSource:
+            return SessionSource(
+                platform=Platform.FEISHU,
+                chat_id="oc_group",
+                chat_name="Platform Team",
+                chat_type="group",
+                user_id=user_id,
+                user_id_alt=union_id,
+            )
+
+        def _raw(open_id: str, user_id: str, union_id: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                event=SimpleNamespace(
+                    sender=SimpleNamespace(
+                        sender_id=SimpleNamespace(
+                            open_id=open_id,
+                            user_id=user_id,
+                            union_id=union_id,
+                        )
+                    )
+                )
+            )
+
+        admin = MessageEvent(
+            text="admin chunk",
+            source=_source("u_admin", "on_admin"),
+            raw_message=_raw("ou_admin", "u_admin", "on_admin"),
+            message_id="om_admin",
+        )
+        member = MessageEvent(
+            text="member chunk",
+            source=_source("u_member", "on_member"),
+            raw_message=_raw("ou_member", "u_member", "on_member"),
+            message_id="om_member",
+        )
+
+        async def _run() -> None:
+            await adapter._enqueue_text_event(admin)
+            await adapter._enqueue_text_event(member)
+
+        asyncio.run(_run())
+
+        adapter._handle_message_with_guards.assert_awaited_once_with(admin)
+        key = adapter._text_batch_key(member)
+        pending = adapter._pending_text_batches[key]
+        self.assertEqual(pending.text, "member chunk")
+        self.assertEqual(pending.source.user_id, "u_member")
+
+    def test_text_batch_still_merges_same_sender_in_shared_group(self):
+        from gateway.config import Platform, PlatformConfig
+        from gateway.platforms.base import MessageEvent
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(
+            PlatformConfig(extra={"group_sessions_per_user": False})
+        )
+        adapter._schedule_text_batch_flush = Mock()
+        adapter._handle_message_with_guards = AsyncMock()
+
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_name="Platform Team",
+            chat_type="group",
+            user_id="u_member",
+            user_id_alt="on_member",
+        )
+        raw_message = SimpleNamespace(
+            event=SimpleNamespace(
+                sender=SimpleNamespace(
+                    sender_id=SimpleNamespace(
+                        open_id="ou_member",
+                        user_id="u_member",
+                        union_id="on_member",
+                    )
+                )
+            )
+        )
+
+        first = MessageEvent(
+            text="first chunk",
+            source=source,
+            raw_message=raw_message,
+            message_id="om_1",
+        )
+        second = MessageEvent(
+            text="second chunk",
+            source=source,
+            raw_message=raw_message,
+            message_id="om_2",
+        )
+
+        async def _run() -> None:
+            await adapter._enqueue_text_event(first)
+            await adapter._enqueue_text_event(second)
+
+        asyncio.run(_run())
+
+        adapter._handle_message_with_guards.assert_not_awaited()
+        key = adapter._text_batch_key(first)
+        pending = adapter._pending_text_batches[key]
+        self.assertEqual(pending.text, "first chunk\nsecond chunk")
+        self.assertEqual(pending.source.user_id, "u_member")
+
     @patch.dict(os.environ, {}, clear=True)
     def test_extract_post_message_as_text(self):
         from gateway.config import PlatformConfig

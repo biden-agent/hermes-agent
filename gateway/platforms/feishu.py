@@ -3312,10 +3312,48 @@ class FeishuAdapter(BasePlatformAdapter):
         )
 
     @staticmethod
+    def _text_batch_sender_ids(event: MessageEvent) -> frozenset[str]:
+        """Collect stable sender IDs so shared-session batches don't cross users."""
+        ids: set[str] = set()
+        source = getattr(event, "source", None)
+        for attr in ("user_id", "user_id_alt"):
+            value = getattr(source, attr, None) if source is not None else None
+            text = str(value or "").strip()
+            if text:
+                ids.add(text)
+
+        def _get_field(obj: Any, key: str) -> Any:
+            if obj is None:
+                return None
+            if isinstance(obj, dict):
+                return obj.get(key)
+            return getattr(obj, key, None)
+
+        raw_message = getattr(event, "raw_message", None)
+        raw_event = _get_field(raw_message, "event")
+        sender_id = _get_field(_get_field(raw_event, "sender"), "sender_id")
+        for key in ("open_id", "user_id", "union_id"):
+            value = _get_field(sender_id, key)
+            text = str(value or "").strip()
+            if text:
+                ids.add(text)
+
+        return frozenset(ids)
+
+    @staticmethod
     def _text_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
-        """Only merge text events when reply/thread context is identical."""
+        """Only merge text events when reply/thread/sender context is identical."""
+        existing_sender_ids = FeishuAdapter._text_batch_sender_ids(existing)
+        incoming_sender_ids = FeishuAdapter._text_batch_sender_ids(incoming)
+        same_sender = (
+            bool(existing_sender_ids & incoming_sender_ids)
+            if existing_sender_ids and incoming_sender_ids
+            else existing_sender_ids == incoming_sender_ids
+        )
         return (
-            existing.reply_to_message_id == incoming.reply_to_message_id
+            same_sender
+            and existing.source.chat_id == incoming.source.chat_id
+            and existing.reply_to_message_id == incoming.reply_to_message_id
             and existing.reply_to_text == incoming.reply_to_text
             and existing.source.thread_id == incoming.source.thread_id
             and getattr(existing, "_feishu_group_history_signature", None)

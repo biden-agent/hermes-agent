@@ -2,8 +2,6 @@
 
 import json
 
-from gateway.session_context import clear_session_vars, set_session_vars
-
 import tools.terminal_tool as terminal_tool
 
 
@@ -184,40 +182,3 @@ def test_terminal_tool_blocks_background_gateway_run(monkeypatch):
 
     assert result["status"] == "blocked"
     assert "dual instances" in result["error"]
-
-
-def test_gateway_terminal_command_allowlist_allows_standalone_curl():
-    tokens = set_session_vars(terminal_command_allowlist="curl")
-    try:
-        assert (
-            terminal_tool._check_gateway_terminal_command_allowlist(
-                "curl 'https://example.com?a=1&b=2' -H 'accept: application/json'"
-            )
-            is None
-        )
-    finally:
-        clear_session_vars(tokens)
-
-
-def test_gateway_terminal_command_allowlist_blocks_non_allowlisted_command():
-    tokens = set_session_vars(terminal_command_allowlist="curl")
-    try:
-        error = terminal_tool._check_gateway_terminal_command_allowlist("ls -la")
-    finally:
-        clear_session_vars(tokens)
-
-    assert error is not None
-    assert "Allowed standalone commands: curl" in error
-
-
-def test_gateway_terminal_command_allowlist_blocks_shell_chaining():
-    tokens = set_session_vars(terminal_command_allowlist="curl")
-    try:
-        error = terminal_tool._check_gateway_terminal_command_allowlist(
-            "curl https://example.com && ls"
-        )
-    finally:
-        clear_session_vars(tokens)
-
-    assert error is not None
-    assert "Allowed standalone commands: curl" in error

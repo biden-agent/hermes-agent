@@ -3802,38 +3802,6 @@ class GatewayRunner:
 
         return enabled_toolsets
 
-    def _resolve_effective_terminal_command_allowlist(
-        self,
-        *,
-        user_config: Dict[str, Any],
-        source: SessionSource,
-        actor_ids: Optional[set[str]] = None,
-    ) -> Optional[list[str]]:
-        """Return the member-scoped terminal command allowlist when configured."""
-        platform = getattr(source, "platform", None)
-        extra = self._get_platform_extra_from_user_config(user_config, platform)
-        permissions = extra.get("tool_permissions")
-        if not isinstance(permissions, dict):
-            return None
-        if "enabled" in permissions and not is_truthy_value(permissions.get("enabled"), default=True):
-            return None
-
-        admin_values = permissions.get("admins")
-        if admin_values is None:
-            admin_values = extra.get("admins", [])
-        admin_ids = self._normalize_identity_values(admin_values)
-        effective_actor_ids = set(actor_ids or ()) or self._collect_source_sender_ids(source)
-        if admin_ids and effective_actor_ids and (admin_ids & effective_actor_ids):
-            return None
-
-        allowed_commands = self._normalize_string_values(
-            permissions.get("allowed_terminal_commands"),
-            lowercase=True,
-        )
-        if not allowed_commands or "*" in allowed_commands:
-            return None
-        return sorted(allowed_commands)
-
     @staticmethod
     def _format_command_permission_denial(
         *,
@@ -4988,17 +4956,11 @@ class GatewayRunner:
             source=source,
             actor_ids=actor_ids,
         )
-        _terminal_command_allowlist = self._resolve_effective_terminal_command_allowlist(
-            user_config=_session_user_config,
-            source=source,
-            actor_ids=actor_ids,
-        )
         
         # Set session context variables for tools (task-local, concurrency-safe)
         _session_env_tokens = self._set_session_env(
             context,
             enabled_toolsets=_session_enabled_toolsets,
-            terminal_command_allowlist=_terminal_command_allowlist,
         )
         
         # Read privacy.redact_pii from config (re-read per message)
@@ -9212,7 +9174,6 @@ class GatewayRunner:
         context: SessionContext,
         *,
         enabled_toolsets: Optional[list[str]] = None,
-        terminal_command_allowlist: Optional[list[str]] = None,
     ) -> list:
         """Set session context variables for the current async task.
 
@@ -9233,7 +9194,6 @@ class GatewayRunner:
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             enabled_toolsets=",".join(enabled_toolsets or []),
-            terminal_command_allowlist=",".join(terminal_command_allowlist or []),
         )
 
     def _clear_session_env(self, tokens: list) -> None:

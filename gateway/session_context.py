@@ -57,10 +57,6 @@ _SESSION_USER_ID_ALT: ContextVar = ContextVar("HERMES_SESSION_USER_ID_ALT", defa
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ENABLED_TOOLSETS: ContextVar = ContextVar("HERMES_SESSION_ENABLED_TOOLSETS", default=_UNSET)
-_SESSION_TERMINAL_COMMAND_ALLOWLIST: ContextVar = ContextVar(
-    "HERMES_SESSION_TERMINAL_COMMAND_ALLOWLIST",
-    default=_UNSET,
-)
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
@@ -78,7 +74,6 @@ _VAR_MAP = {
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ENABLED_TOOLSETS": _SESSION_ENABLED_TOOLSETS,
-    "HERMES_SESSION_TERMINAL_COMMAND_ALLOWLIST": _SESSION_TERMINAL_COMMAND_ALLOWLIST,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
@@ -95,7 +90,6 @@ def set_session_vars(
     user_name: str = "",
     session_key: str = "",
     enabled_toolsets: str = "",
-    terminal_command_allowlist: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.
 
@@ -115,7 +109,6 @@ def set_session_vars(
         _SESSION_USER_NAME.set(user_name),
         _SESSION_KEY.set(session_key),
         _SESSION_ENABLED_TOOLSETS.set(enabled_toolsets),
-        _SESSION_TERMINAL_COMMAND_ALLOWLIST.set(terminal_command_allowlist),
     ]
     return tokens
 
@@ -141,7 +134,6 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_USER_NAME,
         _SESSION_KEY,
         _SESSION_ENABLED_TOOLSETS,
-        _SESSION_TERMINAL_COMMAND_ALLOWLIST,
     ):
         var.set("")
 
