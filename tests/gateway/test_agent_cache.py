@@ -155,6 +155,36 @@ class TestAgentConfigSignature:
         )
         assert sig_on != sig_off
 
+    def test_session_search_filters_bust_cache_between_feishu_users(self):
+        """Shared Feishu threads must not reuse an agent with another sender's search scope."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        sig_member = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            ["session_search"],
+            "",
+            session_search_filters={
+                "source_filter": ["feishu"],
+                "user_id_filter": ["on_member", "ou_member", "u_member"],
+                "include_unowned_user_sessions": False,
+            },
+        )
+        sig_other = GatewayRunner._agent_config_signature(
+            "m",
+            runtime,
+            ["session_search"],
+            "",
+            session_search_filters={
+                "source_filter": ["feishu"],
+                "user_id_filter": ["on_other", "ou_other", "u_other"],
+                "include_unowned_user_sessions": False,
+            },
+        )
+
+        assert sig_member != sig_other
+
     def test_cache_keys_key_order_does_not_matter(self):
         """Signature must be stable regardless of dict key insertion order."""
         from gateway.run import GatewayRunner

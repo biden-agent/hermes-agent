@@ -9,15 +9,22 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
-def _make_source(*, user_id: str = "u_member", user_id_alt: str | None = None) -> SessionSource:
+def _make_source(
+    *,
+    user_id: str = "u_member",
+    user_id_alt: str | None = None,
+    chat_type: str = "dm",
+    thread_id: str | None = None,
+) -> SessionSource:
     return SessionSource(
         platform=Platform.FEISHU,
         chat_id="oc_chat",
         chat_name="Feishu Chat",
-        chat_type="dm",
+        chat_type=chat_type,
         user_id=user_id,
         user_id_alt=user_id_alt,
         user_name="tester",
+        thread_id=thread_id,
     )
 
 
@@ -292,3 +299,140 @@ def test_feishu_admin_tool_permissions_bypass_member_limits(monkeypatch):
     )
 
     assert enabled == ["memory", "terminal", "web"]
+
+
+def test_feishu_shared_session_scope_does_not_grant_tool_admin(monkeypatch):
+    import hermes_cli.tools_config as tools_config
+
+    scope_owner = "session_scope:agent:main:feishu:group:oc_chat:omt_thread"
+    runner = _make_runner(
+        admins=[scope_owner],
+        tool_permissions={"allowed_toolsets": ["web"]},
+    )
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda *_args, **_kwargs: {"terminal", "web", "memory"},
+    )
+
+    enabled = runner._resolve_effective_enabled_toolsets(
+        user_config={
+            "platforms": {
+                "feishu": {
+                    "extra": {
+                        "admins": [scope_owner],
+                        "tool_permissions": {"allowed_toolsets": ["web"]},
+                    }
+                }
+            }
+        },
+        source=_make_source(
+            user_id="u_member",
+            user_id_alt="on_member",
+            chat_type="group",
+            thread_id="omt_thread",
+        ),
+        actor_ids={"ou_member", "u_member", "on_member"},
+    )
+
+    assert enabled == ["web"]
+
+
+def test_feishu_member_session_search_filters_to_own_identity():
+    runner = _make_runner(
+        admins=["ou_admin"],
+        tool_permissions={"allowed_toolsets": ["web", "session_search"]},
+    )
+    source = _make_source(user_id="u_member", user_id_alt="on_member")
+
+    filters = runner._resolve_session_search_filters(
+        user_config={
+            "platforms": {
+                "feishu": {
+                    "extra": {
+                        "admins": ["ou_admin"],
+                        "tool_permissions": {"allowed_toolsets": ["web", "session_search"]},
+                    }
+                }
+            }
+        },
+        source=source,
+        actor_ids={"ou_member", "u_member", "on_member"},
+    )
+
+    assert filters == {
+        "source_filter": ["feishu"],
+        "user_id_filter": ["on_member", "ou_member", "u_member"],
+        "include_unowned_user_sessions": False,
+    }
+
+
+def test_feishu_shared_thread_session_search_includes_session_scope():
+    runner = _make_runner(admins=["ou_admin"])
+    source = _make_source(
+        user_id="u_member",
+        user_id_alt="on_member",
+        chat_type="group",
+        thread_id="omt_thread",
+    )
+
+    filters = runner._resolve_session_search_filters(
+        user_config={"platforms": {"feishu": {"extra": {"admins": ["ou_admin"]}}}},
+        source=source,
+        actor_ids={"ou_member", "u_member", "on_member"},
+    )
+
+    assert filters == {
+        "source_filter": ["feishu"],
+        "user_id_filter": [
+            "on_member",
+            "ou_member",
+            "session_scope:agent:main:feishu:group:oc_chat:omt_thread",
+            "u_member",
+        ],
+        "include_unowned_user_sessions": False,
+    }
+
+
+def test_feishu_admin_session_search_filters_to_own_identity():
+    runner = _make_runner(
+        admins=["ou_admin"],
+        tool_permissions={"allowed_toolsets": ["web", "session_search"]},
+    )
+
+    filters = runner._resolve_session_search_filters(
+        user_config={
+            "platforms": {
+                "feishu": {
+                    "extra": {
+                        "admins": ["ou_admin"],
+                        "tool_permissions": {"allowed_toolsets": ["web", "session_search"]},
+                    }
+                }
+            }
+        },
+        source=_make_source(user_id="u_admin", user_id_alt="on_admin"),
+        actor_ids={"ou_admin", "u_admin", "on_admin"},
+    )
+
+    assert filters == {
+        "source_filter": ["feishu"],
+        "user_id_filter": ["on_admin", "ou_admin", "u_admin"],
+        "include_unowned_user_sessions": True,
+    }
+
+
+def test_feishu_session_search_filters_without_tool_permissions():
+    runner = _make_runner(admins=["ou_admin"])
+
+    filters = runner._resolve_session_search_filters(
+        user_config={"platforms": {"feishu": {"extra": {"admins": ["ou_admin"]}}}},
+        source=_make_source(user_id="u_member", user_id_alt="on_member"),
+        actor_ids={"ou_member", "u_member", "on_member"},
+    )
+
+    assert filters == {
+        "source_filter": ["feishu"],
+        "user_id_filter": ["on_member", "ou_member", "u_member"],
+        "include_unowned_user_sessions": False,
+    }

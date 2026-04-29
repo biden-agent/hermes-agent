@@ -1401,6 +1401,75 @@ class TestAdapterBehavior(unittest.TestCase):
             "please help with deploy",
         )
 
+    def test_group_history_includes_marked_bot_response(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"group_history_inject_count": 3}))
+        adapter._client = object()
+        adapter._bot_name = "Hermes"
+        adapter._feishu_send_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_bot_reply"),
+            )
+        )
+
+        result = asyncio.run(adapter.send(
+            "oc_group",
+            "deploy is done",
+            reply_to="om_user_question",
+            metadata={"_hermes_group_history_role": "assistant"},
+        ))
+
+        self.assertTrue(result.success)
+        context = adapter._build_group_history_context(
+            chat_id="oc_group",
+            before_message_id="om_next_question",
+        )
+        self.assertEqual(
+            context,
+            "[Previous group messages]\n"
+            "1. Hermes: deploy is done",
+        )
+
+    def test_streaming_final_edit_updates_bot_history_entry(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"group_history_inject_count": 3}))
+        adapter._client = object()
+        adapter._bot_name = "Hermes"
+        adapter._cache_outbound_group_message(
+            chat_id="oc_group",
+            text="partial answer",
+            message_id="om_stream",
+        )
+        adapter._feishu_edit_with_retry = AsyncMock(
+            return_value=SimpleNamespace(
+                success=lambda: True,
+                data=SimpleNamespace(message_id="om_stream"),
+            )
+        )
+
+        result = asyncio.run(adapter.edit_message(
+            "oc_group",
+            "om_stream",
+            "final answer",
+            finalize=True,
+        ))
+
+        self.assertTrue(result.success)
+        context = adapter._build_group_history_context(
+            chat_id="oc_group",
+            before_message_id="om_next_question",
+        )
+        self.assertEqual(
+            context,
+            "[Previous group messages]\n"
+            "1. Hermes: final answer",
+        )
+
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_mention_history_does_not_merge_into_stale_text_batch(self):
         from gateway.config import PlatformConfig

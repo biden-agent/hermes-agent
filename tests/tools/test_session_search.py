@@ -288,6 +288,51 @@ class TestRecentSessionListing:
         assert [item["session_id"] for item in result["results"]] == ["other_session"]
         assert all(item["session_id"] != "root" for item in result["results"])
 
+    def test_recent_sessions_passes_user_filter_to_db(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = []
+
+        result = json.loads(_list_recent_sessions(
+            mock_db,
+            limit=5,
+            source_filter=["feishu"],
+            user_id_filter=["ou_member", "on_member"],
+        ))
+
+        assert result["success"] is True
+        mock_db.list_sessions_rich.assert_called_once_with(
+            limit=10,
+            source="feishu",
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            user_id_filter=["ou_member", "on_member"],
+            include_unowned_user_sessions=False,
+        )
+
+    def test_recent_sessions_can_include_unowned_sessions(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = []
+
+        result = json.loads(_list_recent_sessions(
+            mock_db,
+            limit=5,
+            source_filter=["feishu"],
+            user_id_filter=["ou_admin", "on_admin"],
+            include_unowned_user_sessions=True,
+        ))
+
+        assert result["success"] is True
+        mock_db.list_sessions_rich.assert_called_once_with(
+            limit=10,
+            source="feishu",
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            user_id_filter=["ou_admin", "on_admin"],
+            include_unowned_user_sessions=True,
+        )
+
 
 # =========================================================================
 # session_search (dispatcher)
@@ -454,6 +499,59 @@ class TestSessionSearch:
             query="test", db=mock_db, limit=0,
         ))
         assert result["success"] is True
+
+    def test_search_passes_user_and_source_filters_to_db(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+
+        result = json.loads(session_search(
+            query="test",
+            db=mock_db,
+            source_filter=["feishu"],
+            user_id_filter=["ou_member", "on_member"],
+        ))
+
+        assert result["success"] is True
+        mock_db.search_messages.assert_called_once_with(
+            query="test",
+            source_filter=["feishu"],
+            role_filter=None,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            user_id_filter=["ou_member", "on_member"],
+            include_unowned_user_sessions=False,
+            limit=50,
+            offset=0,
+        )
+
+    def test_search_can_include_unowned_sessions(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+
+        result = json.loads(session_search(
+            query="test",
+            db=mock_db,
+            source_filter=["feishu"],
+            user_id_filter=["ou_admin", "on_admin"],
+            include_unowned_user_sessions=True,
+        ))
+
+        assert result["success"] is True
+        mock_db.search_messages.assert_called_once_with(
+            query="test",
+            source_filter=["feishu"],
+            role_filter=None,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            user_id_filter=["ou_admin", "on_admin"],
+            include_unowned_user_sessions=True,
+            limit=50,
+            offset=0,
+        )
 
     def test_current_root_session_excludes_child_lineage(self):
         """Delegation child hits should be excluded when they resolve to the current root session."""

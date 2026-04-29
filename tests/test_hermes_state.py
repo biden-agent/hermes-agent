@@ -453,6 +453,40 @@ class TestFTS5Search:
         sources = [r["source"] for r in results]
         assert all(s == "telegram" for s in sources)
 
+    def test_search_with_user_id_filter(self, db):
+        db.create_session(session_id="s1", source="feishu", user_id="on_member")
+        db.append_message("s1", role="user", content="Feishu question about Python")
+
+        db.create_session(session_id="s2", source="feishu", user_id="on_other")
+        db.append_message("s2", role="user", content="Other Feishu question about Python")
+
+        results = db.search_messages("Python", user_id_filter=["on_member"])
+        assert {r["session_id"] for r in results} == {"s1"}
+
+    def test_search_with_empty_user_id_filter_returns_no_rows(self, db):
+        db.create_session(session_id="s1", source="feishu", user_id="on_member")
+        db.append_message("s1", role="user", content="Feishu question about Python")
+
+        assert db.search_messages("Python", user_id_filter=[]) == []
+
+    def test_search_with_user_id_filter_can_include_unowned_sessions(self, db):
+        db.create_session(session_id="s1", source="feishu", user_id="on_admin")
+        db.append_message("s1", role="user", content="Admin Feishu question about Python")
+
+        db.create_session(session_id="s2", source="feishu", user_id="on_other")
+        db.append_message("s2", role="user", content="Other Feishu question about Python")
+
+        db.create_session(session_id="legacy", source="feishu")
+        db.append_message("legacy", role="user", content="Legacy Feishu question about Python")
+
+        results = db.search_messages(
+            "Python",
+            source_filter=["feishu"],
+            user_id_filter=["on_admin"],
+            include_unowned_user_sessions=True,
+        )
+        assert {r["session_id"] for r in results} == {"s1", "legacy"}
+
     def test_search_default_sources_include_acp(self, db):
         db.create_session(session_id="s1", source="acp")
         db.append_message("s1", role="user", content="ACP question about Python")
@@ -772,6 +806,24 @@ class TestCJKSearchFallback:
         results = db.search_messages("记忆断裂", role_filter=["assistant"])
         assert len(results) == 1
         assert results[0]["role"] == "assistant"
+
+    def test_cjk_trigram_preserves_user_id_filter(self, db):
+        db.create_session(session_id="s1", source="feishu", user_id="on_member")
+        db.create_session(session_id="s2", source="feishu", user_id="on_other")
+        db.append_message("s1", role="user", content="飞书群里讨论记忆断裂")
+        db.append_message("s2", role="user", content="其他用户也提到记忆断裂")
+
+        results = db.search_messages("记忆断裂", user_id_filter=["on_member"])
+        assert {r["session_id"] for r in results} == {"s1"}
+
+    def test_short_cjk_like_preserves_user_id_filter(self, db):
+        db.create_session(session_id="s1", source="feishu", user_id="on_member")
+        db.create_session(session_id="s2", source="feishu", user_id="on_other")
+        db.append_message("s1", role="user", content="飞书提醒来自成员")
+        db.append_message("s2", role="user", content="飞书提醒来自其他人")
+
+        results = db.search_messages("飞", user_id_filter=["on_member"])
+        assert {r["session_id"] for r in results} == {"s1"}
 
     def test_cjk_snippet_is_centered_on_match(self, db):
         """Snippet should contain the search term, not just the first N chars."""
@@ -2001,6 +2053,27 @@ class TestExcludeSources:
         assert "s2" not in ids
         assert "s3" not in ids
 
+    def test_list_sessions_rich_user_id_filter(self, db):
+        db.create_session("s1", "feishu", user_id="on_member")
+        db.create_session("s2", "feishu", user_id="on_other")
+        sessions = db.list_sessions_rich(user_id_filter=["on_member"])
+        assert [s["id"] for s in sessions] == ["s1"]
+
+    def test_list_sessions_rich_empty_user_id_filter_returns_no_rows(self, db):
+        db.create_session("s1", "feishu", user_id="on_member")
+        assert db.list_sessions_rich(user_id_filter=[]) == []
+
+    def test_list_sessions_rich_user_id_filter_can_include_unowned_sessions(self, db):
+        db.create_session("s1", "feishu", user_id="on_admin")
+        db.create_session("s2", "feishu", user_id="on_other")
+        db.create_session("legacy", "feishu")
+        sessions = db.list_sessions_rich(
+            source="feishu",
+            user_id_filter=["on_admin"],
+            include_unowned_user_sessions=True,
+        )
+        assert {s["id"] for s in sessions} == {"s1", "legacy"}
+
     def test_search_messages_excludes_tool_source(self, db):
         db.create_session("s1", "cli")
         db.append_message("s1", "user", "Python deployment question")
@@ -2085,6 +2158,34 @@ class TestConcurrentWriteSafety:
         # First write wins — ensure_session must not overwrite
         assert row["source"] == "cli"
         assert row["model"] == "original-model"
+
+    def test_scope_owner_replaces_existing_single_user_owner(self, db):
+        db.create_session(
+            session_id="shared-thread",
+            source="feishu",
+            user_id="on_first_user",
+        )
+
+        db.ensure_session(
+            "shared-thread",
+            source="feishu",
+            user_id="session_scope:agent:main:feishu:group:oc_chat:omt_thread",
+        )
+
+        row = db.get_session("shared-thread")
+        assert row["user_id"] == "session_scope:agent:main:feishu:group:oc_chat:omt_thread"
+
+    def test_single_user_owner_does_not_replace_existing_owner(self, db):
+        db.create_session(
+            session_id="private-session",
+            source="feishu",
+            user_id="u_member",
+        )
+
+        db.ensure_session("private-session", source="feishu", user_id="on_member")
+
+        row = db.get_session("private-session")
+        assert row["user_id"] == "u_member"
 
     def test_ensure_session_allows_append_message_after_failed_create(self, db):
         """Messages can be flushed even when create_session failed at startup.
@@ -2484,4 +2585,3 @@ class TestFTS5ToolCallMigration:
             assert version == 11
         finally:
             session_db.close()
-

@@ -488,6 +488,7 @@ platforms:
 - `allowed_toolsets` is an allowlist intersected with the normal `hermes-feishu` preset.
 - `disabled_toolsets` subtracts risky toolsets from non-admin access.
 - If both are set, Hermes first applies `allowed_toolsets`, then removes anything listed in `disabled_toolsets`.
+- On Feishu, `session_search` is restricted to the sender's own Feishu sessions plus the current shared thread/group session scope when sessions are shared. Admins can also search legacy Feishu sessions that predate per-user indexing and therefore have no stored `user_id` owner.
 - For Feishu, admin matching accepts any sender ID Hermes sees for that user (`open_id`, `user_id`, or `union_id` when available), so you can keep using the same `admins` list as the group ACL examples above.
 
 ## Deduplication

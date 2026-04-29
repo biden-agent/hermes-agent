@@ -204,6 +204,8 @@ _DEFAULT_MEDIA_BATCH_DELAY_SECONDS = 0.8
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
 _FEISHU_GROUP_HISTORY_SIZE = 100
 _DEFAULT_FEISHU_GROUP_HISTORY_INJECT_COUNT = 5
+_GROUP_HISTORY_METADATA_ROLE = "_hermes_group_history_role"
+_GROUP_HISTORY_ROLE_ASSISTANT = "assistant"
 _DEFAULT_WEBHOOK_HOST = "127.0.0.1"
 _DEFAULT_WEBHOOK_PORT = 8765
 _DEFAULT_WEBHOOK_PATH = "/feishu/webhook"
@@ -1730,7 +1732,14 @@ class FeishuAdapter(BasePlatformAdapter):
                     )
                 last_response = response
 
-            return self._finalize_send_result(last_response, "send failed")
+            result = self._finalize_send_result(last_response, "send failed")
+            if result.success and self._should_cache_outbound_group_history(metadata):
+                self._cache_outbound_group_message(
+                    chat_id=chat_id,
+                    text=formatted,
+                    message_id=result.message_id,
+                )
+            return result
         except Exception as exc:
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
@@ -1765,6 +1774,12 @@ class FeishuAdapter(BasePlatformAdapter):
                 result = self._finalize_send_result(fallback_response, "update failed")
             if result.success:
                 result.message_id = message_id
+                if finalize:
+                    self._cache_outbound_group_message(
+                        chat_id=chat_id,
+                        text=content,
+                        message_id=message_id,
+                    )
             return result
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
@@ -2340,7 +2355,40 @@ class FeishuAdapter(BasePlatformAdapter):
         if history is None:
             history = deque(maxlen=_FEISHU_GROUP_HISTORY_SIZE)
             history_map[entry.chat_id] = history
+        for idx, existing in enumerate(history):
+            if existing.message_id and existing.message_id == entry.message_id:
+                history[idx] = entry
+                return
         history.append(entry)
+
+    def _cache_outbound_group_message(
+        self,
+        *,
+        chat_id: str,
+        text: str,
+        message_id: Optional[str] = None,
+    ) -> None:
+        rendered = (text or "").strip()
+        if not rendered:
+            return
+        self._append_group_message_history(
+            FeishuGroupMessageCacheEntry(
+                message_id=str(message_id or f"bot:{uuid.uuid4()}"),
+                chat_id=str(chat_id or ""),
+                text=rendered,
+                sender_name=self._bot_name or "Hermes",
+                user_id=self._bot_user_id or None,
+                open_id=self._bot_open_id or None,
+                union_id=None,
+            )
+        )
+
+    @staticmethod
+    def _should_cache_outbound_group_history(metadata: Optional[Dict[str, Any]]) -> bool:
+        return bool(
+            isinstance(metadata, dict)
+            and metadata.get(_GROUP_HISTORY_METADATA_ROLE) == _GROUP_HISTORY_ROLE_ASSISTANT
+        )
 
     def _build_group_history_context(self, *, chat_id: str, before_message_id: str) -> str:
         history = getattr(self, "_group_message_history", {}).get(chat_id)

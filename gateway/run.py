@@ -429,6 +429,7 @@ from gateway.session import (
     build_session_context,
     build_session_context_prompt,
     build_session_key,
+    build_session_owner_key,
     is_shared_multi_user_session,
 )
 from gateway.delivery import DeliveryRouter
@@ -3753,6 +3754,31 @@ class GatewayRunner:
         _add_ids(_get_field(raw_event, "operator"))
         return ids
 
+    def _sender_matches_platform_admin(
+        self,
+        *,
+        extra: Dict[str, Any],
+        permissions: Dict[str, Any],
+        source: Optional[SessionSource],
+        actor_ids: Optional[set[str]] = None,
+    ) -> bool:
+        """Return True when any known sender identity is a configured admin."""
+        admin_values = permissions.get("admins") if isinstance(permissions, dict) else None
+        if admin_values is None:
+            admin_values = extra.get("admins", [])
+        admin_ids = self._normalize_identity_values(admin_values)
+        effective_actor_ids = set(actor_ids or ())
+        effective_actor_ids.update(self._collect_source_sender_ids(source))
+        return bool(admin_ids and effective_actor_ids and (admin_ids & effective_actor_ids))
+
+    def _resolve_session_owner_user_id(self, source: SessionSource) -> Optional[str]:
+        """Return the DB owner/scope key for session history visibility."""
+        return build_session_owner_key(
+            source,
+            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+        )
+
     def _resolve_effective_enabled_toolsets(
         self,
         *,
@@ -3774,12 +3800,12 @@ class GatewayRunner:
         if "enabled" in permissions and not is_truthy_value(permissions.get("enabled"), default=True):
             return enabled_toolsets
 
-        admin_values = permissions.get("admins")
-        if admin_values is None:
-            admin_values = extra.get("admins", [])
-        admin_ids = self._normalize_identity_values(admin_values)
-        effective_actor_ids = set(actor_ids or ()) or self._collect_source_sender_ids(source)
-        if admin_ids and effective_actor_ids and (admin_ids & effective_actor_ids):
+        if self._sender_matches_platform_admin(
+            extra=extra,
+            permissions=permissions,
+            source=source,
+            actor_ids=actor_ids,
+        ):
             return enabled_toolsets
 
         allowed_toolsets = self._normalize_string_values(
@@ -3801,6 +3827,41 @@ class GatewayRunner:
             ]
 
         return enabled_toolsets
+
+    def _resolve_session_search_filters(
+        self,
+        *,
+        user_config: Dict[str, Any],
+        source: SessionSource,
+        actor_ids: Optional[set[str]] = None,
+    ) -> Dict[str, Optional[list[str]]]:
+        """Return per-user session_search filters for Feishu gateway users."""
+        platform = getattr(source, "platform", None)
+        if platform != Platform.FEISHU:
+            return {}
+
+        extra = self._get_platform_extra_from_user_config(user_config, platform)
+        is_admin = self._sender_matches_platform_admin(
+            extra=extra,
+            permissions={},
+            source=source,
+            actor_ids=actor_ids,
+        )
+        effective_actor_ids = set(actor_ids or ())
+        effective_actor_ids.update(self._collect_source_sender_ids(source))
+        if is_shared_multi_user_session(
+            source,
+            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+        ):
+            scope_owner_id = self._resolve_session_owner_user_id(source)
+            if scope_owner_id:
+                effective_actor_ids.add(scope_owner_id)
+        return {
+            "source_filter": [platform.value],
+            "user_id_filter": sorted(effective_actor_ids),
+            "include_unowned_user_sessions": is_admin,
+        }
 
     @staticmethod
     def _format_command_permission_denial(
@@ -7547,6 +7608,11 @@ class GatewayRunner:
                 source=source,
                 actor_ids=actor_ids,
             )
+            session_search_filters = self._resolve_session_search_filters(
+                user_config=user_config,
+                source=source,
+                actor_ids=actor_ids,
+            )
 
             pr = self._provider_routing
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -7575,11 +7641,16 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    user_id_alt=source.user_id_alt,
+                    session_owner_user_id=self._resolve_session_owner_user_id(source),
                     user_name=source.user_name,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
+                    session_search_source_filter=session_search_filters.get("source_filter"),
+                    session_search_user_id_filter=session_search_filters.get("user_id_filter"),
+                    session_search_include_unowned_user_sessions=session_search_filters.get("include_unowned_user_sessions", False),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -9734,6 +9805,7 @@ class GatewayRunner:
         enabled_toolsets: list,
         ephemeral_prompt: str,
         cache_keys: dict | None = None,
+        session_search_filters: dict | None = None,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -9771,6 +9843,7 @@ class GatewayRunner:
                 # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
                 _cache_keys_sorted,
+                session_search_filters or {},
             ],
             sort_keys=True,
             default=str,
@@ -10481,6 +10554,11 @@ class GatewayRunner:
             source=source,
             actor_ids=actor_ids,
         )
+        session_search_filters = self._resolve_session_search_filters(
+            user_config=user_config,
+            source=source,
+            actor_ids=actor_ids,
+        )
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -11064,6 +11142,7 @@ class GatewayRunner:
                 enabled_toolsets,
                 combined_ephemeral,
                 cache_keys=self._extract_cache_busting_config(user_config),
+                session_search_filters=session_search_filters,
             )
             agent = None
             _cache_lock = getattr(self, "_agent_cache_lock", None)
@@ -11106,12 +11185,17 @@ class GatewayRunner:
                     session_id=session_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    user_id_alt=source.user_id_alt,
+                    session_owner_user_id=self._resolve_session_owner_user_id(source),
                     user_name=source.user_name,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
                     thread_id=source.thread_id,
                     gateway_session_key=session_key,
+                    session_search_source_filter=session_search_filters.get("source_filter"),
+                    session_search_user_id_filter=session_search_filters.get("user_id_filter"),
+                    session_search_include_unowned_user_sessions=session_search_filters.get("include_unowned_user_sessions", False),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )

@@ -62,6 +62,7 @@ from .config import (
 )
 from .whatsapp_identity import (
     canonical_whatsapp_identifier,
+    normalize_whatsapp_identifier,
 )
 from utils import atomic_replace
 
@@ -637,6 +638,36 @@ def build_session_key(
     return ":".join(key_parts)
 
 
+def build_session_owner_key(
+    source: SessionSource,
+    group_sessions_per_user: bool = True,
+    thread_sessions_per_user: bool = False,
+) -> Optional[str]:
+    """Return the session DB owner/scope key for session_search filtering.
+
+    Per-user sessions are owned by the sender's stable identity. Shared
+    multi-user sessions are owned by a namespaced session scope, not by the
+    first participant who happened to create the DB row. This key is only for
+    session history visibility; command/tool permissions must still use the
+    current sender IDs.
+    """
+    if is_shared_multi_user_session(
+        source,
+        group_sessions_per_user=group_sessions_per_user,
+        thread_sessions_per_user=thread_sessions_per_user,
+    ):
+        session_key = build_session_key(
+            source,
+            group_sessions_per_user=group_sessions_per_user,
+            thread_sessions_per_user=thread_sessions_per_user,
+        )
+        return f"session_scope:{session_key}"
+
+    owner = source.user_id_alt or source.user_id
+    owner = str(owner or "").strip()
+    return owner or None
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -908,7 +939,11 @@ class SessionStore:
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": source.platform.value,
-                "user_id": source.user_id,
+                "user_id": build_session_owner_key(
+                    source,
+                    group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+                    thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+                ),
             }
 
         # SQLite operations outside the lock
@@ -1128,7 +1163,11 @@ class SessionStore:
             db_create_kwargs = {
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
-                "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "user_id": build_session_owner_key(
+                    old_entry.origin,
+                    group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+                    thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
+                ) if old_entry.origin else None,
             }
 
         if self._db and db_end_session_id:

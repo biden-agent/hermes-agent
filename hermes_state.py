@@ -541,6 +541,16 @@ class SessionDB:
                     time.time(),
                 ),
             )
+            if user_id:
+                conn.execute(
+                    """UPDATE sessions
+                       SET user_id = CASE
+                           WHEN user_id IS NULL OR user_id = '' OR ? LIKE 'session_scope:%' THEN ?
+                           ELSE user_id
+                       END
+                       WHERE id = ?""",
+                    (user_id, user_id, session_id),
+                )
         self._execute_write(_do)
         return session_id
 
@@ -679,6 +689,7 @@ class SessionDB:
         session_id: str,
         source: str = "unknown",
         model: str = None,
+        user_id: str = None,
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -689,10 +700,20 @@ class SessionDB:
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
+                   (id, source, user_id, model, started_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (session_id, source, user_id, model, time.time()),
             )
+            if user_id:
+                conn.execute(
+                    """UPDATE sessions
+                       SET user_id = CASE
+                           WHEN user_id IS NULL OR user_id = '' OR ? LIKE 'session_scope:%' THEN ?
+                           ELSE user_id
+                       END
+                       WHERE id = ?""",
+                    (user_id, user_id, session_id),
+                )
         self._execute_write(_do)
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
@@ -929,6 +950,8 @@ class SessionDB:
         self,
         source: str = None,
         exclude_sources: List[str] = None,
+        user_id_filter: List[str] = None,
+        include_unowned_user_sessions: bool = False,
         limit: int = 20,
         offset: int = 0,
         include_children: bool = False,
@@ -953,6 +976,13 @@ class SessionDB:
         delegate subagents and branches hidden. Pass ``False`` to return the
         raw root rows (useful for admin/debug UIs).
         """
+        if user_id_filter is not None or include_unowned_user_sessions:
+            if user_id_filter is None:
+                user_id_filter = []
+            user_id_filter = [str(v).strip() for v in user_id_filter if str(v).strip()]
+            if not user_id_filter and not include_unowned_user_sessions:
+                return []
+
         where_clauses = []
         params = []
 
@@ -977,6 +1007,15 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+        if user_id_filter is not None or include_unowned_user_sessions:
+            placeholders = ",".join("?" for _ in user_id_filter)
+            user_clause_parts = []
+            if user_id_filter:
+                user_clause_parts.append(f"s.user_id IN ({placeholders})")
+                params.extend(user_id_filter)
+            if include_unowned_user_sessions:
+                user_clause_parts.append("(s.user_id IS NULL OR s.user_id = '')")
+            where_clauses.append(f"({' OR '.join(user_clause_parts)})")
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         query = f"""
@@ -1533,6 +1572,8 @@ class SessionDB:
         query: str,
         source_filter: List[str] = None,
         exclude_sources: List[str] = None,
+        user_id_filter: List[str] = None,
+        include_unowned_user_sessions: bool = False,
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
@@ -1556,6 +1597,13 @@ class SessionDB:
         if not query:
             return []
 
+        if user_id_filter is not None or include_unowned_user_sessions:
+            if user_id_filter is None:
+                user_id_filter = []
+            user_id_filter = [str(v).strip() for v in user_id_filter if str(v).strip()]
+            if not user_id_filter and not include_unowned_user_sessions:
+                return []
+
         # Build WHERE clauses dynamically
         where_clauses = ["messages_fts MATCH ?"]
         params: list = [query]
@@ -1569,6 +1617,16 @@ class SessionDB:
             exclude_placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({exclude_placeholders})")
             params.extend(exclude_sources)
+
+        if user_id_filter is not None or include_unowned_user_sessions:
+            user_placeholders = ",".join("?" for _ in user_id_filter)
+            user_clause_parts = []
+            if user_id_filter:
+                user_clause_parts.append(f"s.user_id IN ({user_placeholders})")
+                params.extend(user_id_filter)
+            if include_unowned_user_sessions:
+                user_clause_parts.append("(s.user_id IS NULL OR s.user_id = '')")
+            where_clauses.append(f"({' OR '.join(user_clause_parts)})")
 
         if role_filter:
             role_placeholders = ",".join("?" for _ in role_filter)
@@ -1632,6 +1690,14 @@ class SessionDB:
                 if exclude_sources is not None:
                     tri_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     tri_params.extend(exclude_sources)
+                if user_id_filter is not None or include_unowned_user_sessions:
+                    user_clause_parts = []
+                    if user_id_filter:
+                        user_clause_parts.append(f"s.user_id IN ({','.join('?' for _ in user_id_filter)})")
+                        tri_params.extend(user_id_filter)
+                    if include_unowned_user_sessions:
+                        user_clause_parts.append("(s.user_id IS NULL OR s.user_id = '')")
+                    tri_where.append(f"({' OR '.join(user_clause_parts)})")
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
@@ -1674,6 +1740,14 @@ class SessionDB:
                 if exclude_sources is not None:
                     like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
                     like_params.extend(exclude_sources)
+                if user_id_filter is not None or include_unowned_user_sessions:
+                    user_clause_parts = []
+                    if user_id_filter:
+                        user_clause_parts.append(f"s.user_id IN ({','.join('?' for _ in user_id_filter)})")
+                        like_params.extend(user_id_filter)
+                    if include_unowned_user_sessions:
+                        user_clause_parts.append("(s.user_id IS NULL OR s.user_id = '')")
+                    like_where.append(f"({' OR '.join(user_clause_parts)})")
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
@@ -2091,4 +2165,3 @@ class SessionDB:
             result["error"] = str(exc)
 
         return result
-

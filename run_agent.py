@@ -918,12 +918,17 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        user_id_alt: str = None,
+        session_owner_user_id: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
         chat_type: str = None,
         thread_id: str = None,
         gateway_session_key: str = None,
+        session_search_source_filter: List[str] = None,
+        session_search_user_id_filter: List[str] = None,
+        session_search_include_unowned_user_sessions: bool = False,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
@@ -991,12 +996,17 @@ class AIAgent:
         self.ephemeral_system_prompt = ephemeral_system_prompt
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
+        self._user_id_alt = user_id_alt
+        self._session_owner_user_id = session_owner_user_id or user_id_alt or user_id
         self._user_name = user_name
         self._chat_id = chat_id
         self._chat_name = chat_name
         self._chat_type = chat_type
         self._thread_id = thread_id
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        self._session_search_source_filter = list(session_search_source_filter or []) or None
+        self._session_search_user_id_filter = list(session_search_user_id_filter or []) if session_search_user_id_filter is not None else None
+        self._session_search_include_unowned_user_sessions = bool(session_search_include_unowned_user_sessions)
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1608,7 +1618,7 @@ class AIAgent:
                         "reasoning_config": reasoning_config,
                         "max_tokens": max_tokens,
                     },
-                    user_id=None,
+                    user_id=self._session_owner_user_id,
                     parent_session_id=self._parent_session_id,
                 )
             except Exception as e:
@@ -1695,6 +1705,8 @@ class AIAgent:
                         # Thread gateway user identity for per-user memory scoping
                         if self._user_id:
                             _init_kwargs["user_id"] = self._user_id
+                        if self._user_id_alt:
+                            _init_kwargs["user_id_alt"] = self._user_id_alt
                         if self._user_name:
                             _init_kwargs["user_name"] = self._user_name
                         if self._chat_id:
@@ -3628,6 +3640,7 @@ class AIAgent:
                 self.session_id,
                 source=self.platform or "cli",
                 model=self.model,
+                user_id=self._session_owner_user_id,
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
@@ -8888,6 +8901,7 @@ class AIAgent:
                     session_id=self.session_id,
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
+                    user_id=self._session_owner_user_id,
                     parent_session_id=old_session_id,
                 )
                 # Auto-number the title for the continuation session
@@ -9032,6 +9046,9 @@ class AIAgent:
                 limit=function_args.get("limit", 3),
                 db=self._session_db,
                 current_session_id=self.session_id,
+                source_filter=self._session_search_source_filter,
+                user_id_filter=self._session_search_user_id_filter,
+                include_unowned_user_sessions=self._session_search_include_unowned_user_sessions,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -9571,6 +9588,9 @@ class AIAgent:
                         limit=function_args.get("limit", 3),
                         db=self._session_db,
                         current_session_id=self.session_id,
+                        source_filter=self._session_search_source_filter,
+                        user_id_filter=self._session_search_user_id_filter,
+                        include_unowned_user_sessions=self._session_search_include_unowned_user_sessions,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():

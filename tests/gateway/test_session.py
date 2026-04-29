@@ -11,6 +11,7 @@ from gateway.session import (
     build_session_context,
     build_session_context_prompt,
     build_session_key,
+    build_session_owner_key,
     canonical_whatsapp_identifier,
     normalize_whatsapp_identifier,
 )
@@ -1022,6 +1023,89 @@ class TestSessionStoreEntriesAttribute:
         store._loaded = True
         assert hasattr(store, "_entries")
         assert not hasattr(store, "_sessions")
+
+
+class TestSessionOwnerKey:
+    def test_per_user_owner_prefers_alt_identity(self):
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_type="group",
+            user_id="u_member",
+            user_id_alt="on_member",
+        )
+
+        assert build_session_owner_key(source) == "on_member"
+
+    def test_shared_thread_owner_uses_session_scope(self):
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_type="group",
+            thread_id="omt_thread",
+            user_id="u_member",
+            user_id_alt="on_member",
+        )
+
+        assert (
+            build_session_owner_key(source)
+            == "session_scope:agent:main:feishu:group:oc_group:omt_thread"
+        )
+
+    def test_session_store_creates_shared_thread_with_scope_owner(self, tmp_path):
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._entries = {}
+        store._db = MagicMock()
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_type="group",
+            thread_id="omt_thread",
+            user_id="u_member",
+            user_id_alt="on_member",
+        )
+
+        store.get_or_create_session(source)
+
+        _, kwargs = store._db.create_session.call_args
+        assert kwargs["user_id"] == "session_scope:agent:main:feishu:group:oc_group:omt_thread"
+
+    def test_reset_shared_thread_preserves_scope_owner(self, tmp_path):
+        from datetime import datetime
+        from gateway.session import SessionEntry
+
+        config = GatewayConfig()
+        store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = MagicMock()
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_group",
+            chat_type="group",
+            thread_id="omt_thread",
+            user_id="u_member",
+            user_id_alt="on_member",
+        )
+        session_key = build_session_key(source)
+        store._entries = {
+            session_key: SessionEntry(
+                session_key=session_key,
+                session_id="old-session",
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
+                origin=source,
+                platform=Platform.FEISHU,
+                chat_type="group",
+            )
+        }
+
+        store.reset_session(session_key)
+
+        store._db.end_session.assert_called_once_with("old-session", "session_reset")
+        _, kwargs = store._db.create_session.call_args
+        assert kwargs["user_id"] == "session_scope:agent:main:feishu:group:oc_group:omt_thread"
 
 
 class TestHasAnySessions:
