@@ -1884,6 +1884,11 @@ class FeishuAdapter(BasePlatformAdapter):
             or cls._metadata_field(metadata, "user_id")
             or cls._metadata_field(source, "feishu_user_id")
         )
+        union_id = (
+            cls._metadata_field(metadata, "requester_union_id")
+            or cls._metadata_field(metadata, "union_id")
+            or cls._metadata_field(source, "union_id")
+        )
 
         source_user_id = cls._metadata_field(source, "user_id")
         if source_user_id:
@@ -1893,7 +1898,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 user_id = source_user_id
 
         source_alt_id = cls._metadata_field(source, "user_id_alt")
-        if source_alt_id and not user_id:
+        if source_alt_id.startswith("on_") and not union_id:
+            union_id = source_alt_id
+        elif source_alt_id and not user_id:
             user_id = source_alt_id
 
         state: Dict[str, str] = {}
@@ -1901,6 +1908,8 @@ class FeishuAdapter(BasePlatformAdapter):
             state["requester_open_id"] = open_id
         if user_id:
             state["requester_user_id"] = user_id
+        if union_id:
+            state["requester_union_id"] = union_id
         return state
 
     @staticmethod
@@ -2623,16 +2632,17 @@ class FeishuAdapter(BasePlatformAdapter):
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         user_id = str(getattr(operator, "user_id", "") or "")
-        user_name = self._get_cached_sender_name(open_id) or open_id
+        union_id = str(getattr(operator, "union_id", "") or "")
+        user_name = self._get_cached_sender_name(open_id) or open_id or union_id or user_id
 
         state = self._approval_state.get(approval_id)
         if state is None:
             logger.debug("[Feishu] Approval %s already resolved or unknown", approval_id)
             return self._approval_callback_response(self._build_stale_approval_card())
-        if not self._is_approval_operator_authorized(state, open_id=open_id, user_id=user_id):
+        if not self._is_approval_operator_authorized(state, open_id=open_id, user_id=user_id, union_id=union_id):
             logger.info(
-                "Ignoring unauthorized Feishu approval click for approval %s (open_id=%s, user_id=%s)",
-                approval_id, open_id, user_id,
+                "Ignoring unauthorized Feishu approval click for approval %s (open_id=%s, user_id=%s, union_id=%s)",
+                approval_id, open_id, user_id, union_id,
             )
             return self._approval_callback_response(self._build_unauthorized_approval_card())
 
@@ -2642,8 +2652,15 @@ class FeishuAdapter(BasePlatformAdapter):
             self._build_resolved_approval_card(choice=choice, user_name=user_name)
         )
 
-    def _is_approval_operator_authorized(self, state: Dict[str, str], *, open_id: str, user_id: str) -> bool:
-        operator_ids = {value for value in (open_id, user_id) if value}
+    def _is_approval_operator_authorized(
+        self,
+        state: Dict[str, str],
+        *,
+        open_id: str,
+        user_id: str,
+        union_id: str,
+    ) -> bool:
+        operator_ids = {value for value in (open_id, user_id, union_id) if value}
         if operator_ids & self._admins:
             return True
 
@@ -2652,6 +2669,7 @@ class FeishuAdapter(BasePlatformAdapter):
             for value in (
                 state.get("requester_open_id"),
                 state.get("requester_user_id"),
+                state.get("requester_union_id"),
             )
             if value
         }

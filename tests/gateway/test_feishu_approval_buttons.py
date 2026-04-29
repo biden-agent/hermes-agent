@@ -59,6 +59,7 @@ def _make_card_action_data(
     chat_id: str = "oc_12345",
     open_id: str = "ou_user1",
     user_id: str = "u_user1",
+    union_id: str = "on_user1",
     token: str = "tok_abc",
 ) -> SimpleNamespace:
     """Create a mock Feishu card action callback data object."""
@@ -66,7 +67,7 @@ def _make_card_action_data(
         event=SimpleNamespace(
             token=token,
             context=SimpleNamespace(open_chat_id=chat_id),
-            operator=SimpleNamespace(open_id=open_id, user_id=user_id),
+            operator=SimpleNamespace(open_id=open_id, user_id=user_id, union_id=union_id),
             action=SimpleNamespace(
                 tag="button",
                 value=action_value,
@@ -181,6 +182,35 @@ class TestFeishuExecApproval:
         state = next(iter(adapter._approval_state.values()))
         assert state["requester_open_id"] == "ou_requester"
         assert state["requester_user_id"] == "u_requester"
+
+    @pytest.mark.asyncio
+    async def test_stores_requester_union_id_separately_from_user_id(self):
+        adapter = _make_adapter()
+
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_requester_union"),
+        )
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            await adapter.send_exec_approval(
+                chat_id="oc_12345",
+                command="echo test",
+                session_key="my-session-key",
+                metadata={
+                    "source": {
+                        "user_id": "ou_requester",
+                        "user_id_alt": "on_requester",
+                    },
+                },
+            )
+
+        state = next(iter(adapter._approval_state.values()))
+        assert state["requester_open_id"] == "ou_requester"
+        assert state["requester_union_id"] == "on_requester"
+        assert "requester_user_id" not in state
 
     @pytest.mark.asyncio
     async def test_not_connected(self):
@@ -458,6 +488,36 @@ class TestCardActionCallbackResponse:
         assert 11 in adapter._approval_state
         mock_submit.assert_called_once()
 
+    def test_original_requester_click_resolves_by_union_id(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._approval_state[13] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_013",
+            "chat_id": "oc_12345",
+            "requester_open_id": "ou_requester",
+            "requester_user_id": "u_requester",
+            "requester_union_id": "on_requester",
+        }
+        loop = MagicMock()
+        event = _make_card_action_data(
+            {"hermes_action": "approve_session", "approval_id": 13},
+            open_id="ou_different",
+            user_id="u_different",
+            union_id="on_requester",
+        ).event
+
+        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=event.action.value,
+                loop=loop,
+            )
+
+        assert response.card.data["header"]["template"] == "green"
+        assert "Approved for session" in response.card.data["header"]["title"]["content"]
+        assert 13 in adapter._approval_state
+        mock_submit.assert_called_once()
+
     def test_bot_admin_click_resolves_approval(self, _patch_callback_card_types):
         adapter = _make_adapter()
         adapter._admins = {"u_admin"}
@@ -486,6 +546,65 @@ class TestCardActionCallbackResponse:
         assert "Denied" in response.card.data["header"]["title"]["content"]
         assert 12 in adapter._approval_state
         mock_submit.assert_called_once()
+
+    def test_bot_admin_click_resolves_by_union_id(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._admins = {"on_admin"}
+        adapter._approval_state[14] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_014",
+            "chat_id": "oc_12345",
+            "requester_open_id": "ou_requester",
+            "requester_user_id": "u_requester",
+            "requester_union_id": "on_requester",
+        }
+        loop = MagicMock()
+        event = _make_card_action_data(
+            {"hermes_action": "deny", "approval_id": 14},
+            open_id="ou_admin",
+            user_id="u_admin",
+            union_id="on_admin",
+        ).event
+
+        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=event.action.value,
+                loop=loop,
+            )
+
+        assert response.card.data["header"]["template"] == "red"
+        assert "Denied" in response.card.data["header"]["title"]["content"]
+        assert 14 in adapter._approval_state
+        mock_submit.assert_called_once()
+
+    def test_nonmatching_union_id_is_rejected(self, _patch_callback_card_types):
+        adapter = _make_adapter()
+        adapter._approval_state[15] = {
+            "session_key": "agent:main:feishu:group:oc_12345",
+            "message_id": "msg_015",
+            "chat_id": "oc_12345",
+            "requester_union_id": "on_requester",
+        }
+        loop = MagicMock()
+        event = _make_card_action_data(
+            {"hermes_action": "approve_once", "approval_id": 15},
+            open_id="ou_intruder",
+            user_id="u_intruder",
+            union_id="on_intruder",
+        ).event
+
+        with patch.object(adapter, "_submit_on_loop") as mock_submit:
+            response = adapter._handle_approval_card_action(
+                event=event,
+                action_value=event.action.value,
+                loop=loop,
+            )
+
+        assert response.card.data["header"]["template"] == "orange"
+        assert "only the original requester or bot admins" in response.card.data["elements"][0]["content"].lower()
+        assert 15 in adapter._approval_state
+        mock_submit.assert_not_called()
 
     def test_stale_approval_click_returns_already_resolved_card(self, _patch_callback_card_types):
         adapter = _make_adapter()
