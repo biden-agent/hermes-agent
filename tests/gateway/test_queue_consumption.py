@@ -140,6 +140,40 @@ class TestQueueMessageStorage:
 
         assert adapter.has_pending_interrupt(session_key)
 
+    @pytest.mark.asyncio
+    async def test_pending_handoff_does_not_carry_typing_stop_interrupt(self):
+        """Draining a queued message must not inherit the typing stop signal."""
+        adapter = _StubAdapter()
+        session_key = "telegram:user:123"
+        source = adapter.build_source(chat_id="123", chat_type="dm", user_id="u1")
+        first = MessageEvent(
+            text="first",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="m1",
+        )
+        second = MessageEvent(
+            text="second",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="m2",
+        )
+        observed = []
+
+        async def handler(event):
+            observed.append((event.text, adapter.has_pending_interrupt(session_key)))
+            if event.text == "first":
+                adapter._pending_messages[session_key] = second
+                return "first done"
+            return "second done"
+
+        adapter.set_message_handler(handler)
+        adapter._active_sessions[session_key] = asyncio.Event()
+
+        await adapter._process_message_background(first, session_key)
+
+        assert observed == [("first", False), ("second", False)]
+
 
 class TestQueueConsumptionAfterCompletion:
     """Verify that pending messages are consumed after normal completion."""

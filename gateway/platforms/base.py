@@ -2645,6 +2645,12 @@ class BasePlatformAdapter(ABC):
                 if _active is not None:
                     _active.clear()
                 await self._stop_typing_task(typing_task, stop_event=interrupt_event)
+                # _stop_typing_task sets the shared Event to wake the typing
+                # loop. Clear it again before handing the same guard to the
+                # queued turn, otherwise the new agent sees a phantom interrupt.
+                _active = self._active_sessions.get(session_key)
+                if _active is not None:
+                    _active.clear()
                 # Process pending message in new background task
                 await self._process_message_background(pending_event, session_key)
                 return  # Already cleaned up
