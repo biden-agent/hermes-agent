@@ -144,8 +144,8 @@ class TestFeishuExecApproval:
             success=lambda: True,
             data=SimpleNamespace(message_id="msg_logged"),
         )
-        secret_tail = "SECRET_TOKEN_SHOULD_NOT_APPEAR"
-        command = "bash -lc 'deploy --token " + secret_tail + "'"
+        raw_token = "sk-proj-" + "c" * 24
+        command = "bash -lc 'deploy --token " + raw_token + "'"
 
         caplog.set_level(logging.INFO, logger=feishu_module.logger.name)
         with patch.object(
@@ -168,7 +168,7 @@ class TestFeishuExecApproval:
         assert "session_key=agent:main:feishu:group:oc_logged" in log_text
         assert "description=dangerous deploy" in log_text
         assert "command=" in log_text
-        assert secret_tail in log_text
+        assert raw_token in log_text
 
     @pytest.mark.asyncio
     async def test_stores_approval_state(self):

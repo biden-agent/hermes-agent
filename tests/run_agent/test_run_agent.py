@@ -1591,9 +1591,10 @@ class TestExecuteToolCalls:
         assert "search result" in messages[0]["content"]
 
     def test_tool_call_observability_logs_start_and_end(self, agent, caplog):
+        raw_token = "sk-proj-" + "a" * 24
         tc = _mock_tool_call(
             name="terminal",
-            arguments='{"command":"bash -lc \\\"deploy --token SECRET_TOKEN_SHOULD_NOT_APPEAR\\\""}',
+            arguments=json.dumps({"command": f'bash -lc "deploy --token {raw_token}"'}),
             call_id="c-observe",
         )
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
@@ -1620,7 +1621,37 @@ class TestExecuteToolCalls:
         assert "status=approval_required" in log_text
         assert "exit_code=0" in log_text
         assert "approval_required=True" in log_text
-        assert "SECRET_TOKEN_SHOULD_NOT_APPEAR" in log_text
+        assert raw_token in log_text
+
+    def test_tool_call_observability_respects_redacting_formatter(self, monkeypatch):
+        from agent.redact import RedactingFormatter
+
+        raw_token = "sk-proj-" + "b" * 24
+        fields = run_agent._format_observability_fields(
+            run_agent._tool_call_observability_fields(
+                "terminal",
+                {"command": f"deploy --token {raw_token}"},
+            )
+        )
+
+        assert raw_token in fields
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", True)
+
+        formatter = RedactingFormatter("%(message)s")
+        record = logging.LogRecord(
+            name="run_agent",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=0,
+            msg="tool call start %s",
+            args=(fields,),
+            exc_info=None,
+        )
+        formatted = formatter.format(record)
+
+        assert raw_token not in formatted
+        assert "tool call start" in formatted
+        assert "command=" in formatted
 
     def test_api_call_heartbeat_logs_periodic_wait(self, caplog):
         caplog.set_level(logging.INFO, logger=run_agent.logger.name)
