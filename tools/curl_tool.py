@@ -6,10 +6,8 @@ It only performs HTTP(S) requests and returns the response inline.
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
-import socket
 import time
 from typing import Any, Dict, Optional
 from urllib.parse import urljoin, urlparse
@@ -17,21 +15,12 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 from tools.registry import registry
+from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
 
 _ALLOWED_METHODS = {"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
-_BLOCKED_HOSTNAMES = {"metadata.google.internal", "metadata.goog"}
-_ALWAYS_BLOCKED_IPS = {
-    ipaddress.ip_address("169.254.169.254"),
-    ipaddress.ip_address("169.254.170.2"),
-    ipaddress.ip_address("169.254.169.253"),
-    ipaddress.ip_address("fd00:ec2::254"),
-    ipaddress.ip_address("100.100.100.200"),
-}
-_ALWAYS_BLOCKED_NETWORKS = (ipaddress.ip_network("169.254.0.0/16"),)
-_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
 
 def _json_result(payload: Dict[str, Any]) -> str:
@@ -44,16 +33,6 @@ def _blocked(message: str, **extra: Any) -> str:
     return _json_result(payload)
 
 
-def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-        return True
-    if ip.is_multicast or ip.is_unspecified:
-        return True
-    if ip in _CGNAT_NETWORK:
-        return True
-    return False
-
-
 def _validate_public_http_url(url: str) -> Optional[str]:
     parsed = urlparse(url)
     scheme = (parsed.scheme or "").lower()
@@ -63,23 +42,9 @@ def _validate_public_http_url(url: str) -> Optional[str]:
     hostname = (parsed.hostname or "").strip().lower().rstrip(".")
     if not hostname:
         return "URL must include a hostname."
-    if hostname in _BLOCKED_HOSTNAMES:
-        return f"Blocked internal metadata hostname: {hostname}"
 
-    try:
-        addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
-    except socket.gaierror:
-        return f"DNS resolution failed for hostname: {hostname}"
-
-    for _family, _type, _proto, _canonname, sockaddr in addr_info:
-        try:
-            ip = ipaddress.ip_address(sockaddr[0])
-        except ValueError:
-            continue
-        if ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS):
-            return f"Blocked cloud metadata or link-local address: {hostname} -> {ip}"
-        if _is_blocked_ip(ip):
-            return f"Blocked private/internal network address: {hostname} -> {ip}"
+    if not is_safe_url(url):
+        return f"Blocked private/internal network address or unsafe URL: {hostname}"
 
     policy_block = check_website_access(url)
     if policy_block:
@@ -233,7 +198,9 @@ CURL_SCHEMA = {
     "description": (
         "Perform a safe HTTP/HTTPS request and return status, headers, and body text. "
         "Only public http:// and https:// URLs are allowed; local file schemes, "
-        "localhost, private networks, link-local addresses, and cloud metadata endpoints are blocked. "
+        "localhost, private networks, link-local addresses, and cloud metadata endpoints are blocked "
+        "unless security.allow_private_urls or browser.allow_private_urls is enabled. "
+        "Cloud metadata endpoints remain blocked even when private URLs are allowed. "
         "The response is returned inline and never written to local files."
     ),
     "parameters": {

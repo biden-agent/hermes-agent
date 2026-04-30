@@ -3,7 +3,7 @@ import socket
 
 import httpx
 
-from tools import curl_tool
+from tools import curl_tool, url_safety
 
 
 def _public_dns(*_args, **_kwargs):
@@ -49,7 +49,8 @@ def test_curl_tool_blocks_file_scheme():
 
 
 def test_curl_tool_blocks_private_address(monkeypatch):
-    monkeypatch.setattr(curl_tool.socket, "getaddrinfo", _private_dns)
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _private_dns)
+    monkeypatch.setattr(url_safety, "_global_allow_private_urls", lambda: False)
 
     result = json.loads(curl_tool.curl_tool("http://127.0.0.1:8080/secret"))
 
@@ -58,8 +59,25 @@ def test_curl_tool_blocks_private_address(monkeypatch):
     assert "private/internal" in result["error"]
 
 
+def test_curl_tool_allows_private_address_when_config_allows(monkeypatch):
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _private_dns)
+    monkeypatch.setattr(url_safety, "_global_allow_private_urls", lambda: True)
+    monkeypatch.setattr(curl_tool, "check_website_access", lambda _url: None)
+
+    request = httpx.Request("GET", "http://127.0.0.1:8080/ok")
+    response = httpx.Response(200, content=b"local ok", request=request)
+    fake_client = _FakeClient([response])
+    monkeypatch.setattr(curl_tool.httpx, "Client", lambda *_args, **_kwargs: fake_client)
+
+    result = json.loads(curl_tool.curl_tool("http://127.0.0.1:8080/ok"))
+
+    assert result["success"] is True
+    assert result["body"] == "local ok"
+
+
 def test_curl_tool_returns_public_http_response(monkeypatch):
-    monkeypatch.setattr(curl_tool.socket, "getaddrinfo", _public_dns)
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _public_dns)
+    monkeypatch.setattr(url_safety, "_global_allow_private_urls", lambda: False)
     monkeypatch.setattr(curl_tool, "check_website_access", lambda _url: None)
 
     request = httpx.Request("GET", "https://example.com/data")
@@ -87,7 +105,8 @@ def test_curl_tool_validates_redirect_targets(monkeypatch):
             return _public_dns()
         return _private_dns()
 
-    monkeypatch.setattr(curl_tool.socket, "getaddrinfo", _dns)
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _dns)
+    monkeypatch.setattr(url_safety, "_global_allow_private_urls", lambda: False)
     monkeypatch.setattr(curl_tool, "check_website_access", lambda _url: None)
 
     request = httpx.Request("GET", "https://example.com/start")
@@ -110,7 +129,8 @@ def test_curl_tool_validates_redirect_targets(monkeypatch):
 
 
 def test_curl_tool_truncates_response_without_exceeding_max_bytes(monkeypatch):
-    monkeypatch.setattr(curl_tool.socket, "getaddrinfo", _public_dns)
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _public_dns)
+    monkeypatch.setattr(url_safety, "_global_allow_private_urls", lambda: False)
     monkeypatch.setattr(curl_tool, "check_website_access", lambda _url: None)
 
     request = httpx.Request("GET", "https://example.com/big")
