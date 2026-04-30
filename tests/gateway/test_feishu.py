@@ -108,6 +108,116 @@ class TestFeishuMessageNormalization(unittest.TestCase):
             "Sprint recap\n- Alice: Please review PR-128\n- Bob: Ship it",
         )
 
+    def test_normalize_merge_forward_expands_json_encoded_content(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="merge_forward",
+            raw_content=json.dumps(
+                {
+                    "content": json.dumps(
+                        {
+                            "message_list": [
+                                {
+                                    "sender": {"name": "Alice"},
+                                    "message_type": "text",
+                                    "content": {"text": "Can you review the rollout plan?"},
+                                },
+                                {
+                                    "sender": {"name": "Bob"},
+                                    "msg_type": "post",
+                                    "body": {
+                                        "content": {
+                                            "zh_cn": {
+                                                "content": [[{"tag": "text", "text": "Risk looks low"}]],
+                                            }
+                                        }
+                                    },
+                                },
+                            ]
+                        }
+                    )
+                }
+            ),
+        )
+
+        self.assertEqual(normalized.relation_kind, "merge_forward")
+        self.assertEqual(
+            normalized.text_content,
+            "- Alice: Can you review the rollout plan?\n- Bob: Risk looks low",
+        )
+
+    def test_normalize_merge_forward_extracts_nested_json_message_bodies(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="merge_forward",
+            raw_content=json.dumps(
+                {
+                    "content": json.dumps(
+                        {
+                            "records": [
+                                {
+                                    "sender": {"name": "Alice"},
+                                    "body": {
+                                        "content": json.dumps(
+                                            {
+                                                "messages": [
+                                                    {
+                                                        "sender_name": "Carol",
+                                                        "content": {"text": "Nested text one"},
+                                                    }
+                                                ]
+                                            }
+                                        )
+                                    },
+                                },
+                                {
+                                    "sender_name": "Bob",
+                                    "body": {
+                                        "content": json.dumps(
+                                            {
+                                                "message_list": [
+                                                    {
+                                                        "sender_name": "Dana",
+                                                        "message_type": "post",
+                                                        "body": {
+                                                            "content": {
+                                                                "en_us": {
+                                                                    "content": [[{"tag": "text", "text": "Nested post two"}]],
+                                                                }
+                                                            }
+                                                        },
+                                                    }
+                                                ]
+                                            }
+                                        )
+                                    },
+                                },
+                            ]
+                        }
+                    )
+                }
+            ),
+        )
+
+        self.assertEqual(normalized.relation_kind, "merge_forward")
+        self.assertEqual(
+            normalized.text_content,
+            "- Carol: Nested text one\n- Dana: Nested post two",
+        )
+
+    def test_normalize_merge_forward_falls_back_when_no_content_is_extractable(self):
+        from gateway.platforms.feishu import normalize_feishu_message
+
+        normalized = normalize_feishu_message(
+            message_type="merge_forward",
+            raw_content=json.dumps({"content": {"message_ids": ["om_1", "om_2"]}}),
+        )
+
+        self.assertEqual(normalized.text_content, "[Merged forward message]")
+        self.assertEqual(normalized.metadata["entry_count"], 0)
+
     def test_normalize_share_chat_exposes_summary_and_metadata(self):
         from gateway.platforms.feishu import normalize_feishu_message
 
@@ -1904,6 +2014,49 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertEqual(media_types, [])
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_placeholder_fetches_message_detail(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._fetch_message_text = AsyncMock(return_value="Forward detail\n- Alice: real body")
+        message = SimpleNamespace(
+            message_type="merge_forward",
+            content=json.dumps({"content": {"message_ids": ["om_a"]}}),
+            message_id="om_merge_forward",
+        )
+
+        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(text, "Forward detail\n- Alice: real body")
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        adapter._fetch_message_text.assert_awaited_once_with("om_merge_forward")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_extract_merge_forward_real_feishu_placeholder_fetches_message_detail(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._fetch_message_text = AsyncMock(return_value="Forward detail\n- Alice: real body")
+        message = SimpleNamespace(
+            message_type="merge_forward",
+            content=json.dumps({"message_type": "merge_forward", "content": "Merged and Forwarded Message"}),
+            message_id="om_merge_forward",
+            mentions=None,
+        )
+
+        text, msg_type, media_urls, media_types, _mentions = asyncio.run(adapter._extract_message_content(message))
+
+        self.assertEqual(text, "Forward detail\n- Alice: real body")
+        self.assertEqual(msg_type.value, "text")
+        self.assertEqual(media_urls, [])
+        self.assertEqual(media_types, [])
+        adapter._fetch_message_text.assert_awaited_once_with("om_merge_forward")
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_extract_share_chat_message_as_text_summary(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -2285,6 +2438,464 @@ class TestAdapterBehavior(unittest.TestCase):
         event = adapter.handle_message.await_args.args[0]
         self.assertEqual(event.text, "A\nB")
         self.assertEqual(event.message_type, MessageType.TEXT)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_merge_forward_text_batch_uses_longer_debounce_window(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter.handle_message = AsyncMock()
+        source = SessionSource(
+            platform=adapter.platform,
+            chat_id="oc_chat",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+        )
+        event = MessageEvent(
+            text="[Merged forward message]",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_forward",
+        )
+        event._feishu_relation_kind = "merge_forward"
+
+        sleep_calls = []
+
+        async def _sleep(delay):
+            sleep_calls.append(delay)
+
+        async def _run() -> None:
+            with patch("gateway.platforms.feishu.asyncio.sleep", side_effect=_sleep):
+                await adapter._dispatch_inbound_event(event)
+                pending = list(adapter._pending_text_batch_tasks.values())
+                self.assertEqual(len(pending), 1)
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run(_run())
+
+        self.assertEqual(sleep_calls, [adapter._text_batch_split_delay_seconds])
+        adapter.handle_message.assert_awaited_once()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_merge_forward_and_immediate_text_question_merge_in_dm(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._schedule_text_batch_flush = Mock()
+        adapter._handle_message_with_guards = AsyncMock()
+        source = SessionSource(
+            platform=adapter.platform,
+            chat_id="oc_chat",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+        )
+        forward = MessageEvent(
+            text="Forwarded thread\n- Alice: Please review PR-128",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_forward",
+        )
+        forward._feishu_relation_kind = "merge_forward"
+        question = MessageEvent(
+            text="What should I reply?",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_question",
+        )
+
+        async def _run() -> None:
+            await adapter._dispatch_inbound_event(forward)
+            await adapter._dispatch_inbound_event(question)
+
+        asyncio.run(_run())
+
+        adapter._handle_message_with_guards.assert_not_awaited()
+        key = adapter._text_batch_key(forward)
+        pending = adapter._pending_text_batches[key]
+        self.assertEqual(
+            pending.text,
+            "Forwarded thread\n- Alice: Please review PR-128\nWhat should I reply?",
+        )
+        self.assertEqual(pending.message_id, "om_question")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_text_batch_waits_for_same_key_inflight_event_before_flush(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter.handle_message = AsyncMock()
+        adapter._text_batch_delay_seconds = 0.01
+        adapter._text_batch_split_delay_seconds = 0.01
+        adapter._text_batch_inflight_poll_seconds = 0.01
+        source = SessionSource(
+            platform=adapter.platform,
+            chat_id="oc_chat",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+        )
+        forward = MessageEvent(
+            text="Forwarded thread\n- Alice: Please review PR-128",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_forward",
+        )
+        forward._feishu_relation_kind = "merge_forward"
+        question = MessageEvent(
+            text="What should I reply?",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_question",
+        )
+
+        async def _run() -> None:
+            await adapter._enqueue_text_event(forward)
+            key = adapter._text_batch_key(forward)
+            first_task = adapter._pending_text_batch_tasks[key]
+            adapter._begin_text_batch_inflight(key)
+            await asyncio.sleep(0.03)
+            adapter.handle_message.assert_not_awaited()
+            await adapter._enqueue_text_event(question)
+            second_task = adapter._pending_text_batch_tasks[key]
+            adapter._end_text_batch_inflight(key)
+            await asyncio.gather(first_task, second_task, return_exceptions=True)
+
+        asyncio.run(_run())
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(
+            event.text,
+            "Forwarded thread\n- Alice: Please review PR-128\nWhat should I reply?",
+        )
+        self.assertEqual(event.message_id, "om_question")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_text_batch_marks_events_waiting_for_inbound_lock_as_inflight(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter.handle_message = AsyncMock()
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Feishu DM", "type": "dm"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": "on_union"}
+        )
+        adapter._extract_message_content = AsyncMock(return_value=("What should I reply?", MessageType.TEXT, [], [], []))
+        adapter._text_batch_delay_seconds = 0.01
+        adapter._text_batch_split_delay_seconds = 0.01
+        adapter._text_batch_inflight_poll_seconds = 0.01
+
+        sender_id = SimpleNamespace(user_id="ou_user", open_id="ou_open", union_id="on_union")
+
+        def _data(message):
+            return SimpleNamespace(event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id)))
+
+        source = SessionSource(
+            platform=adapter.platform,
+            chat_id="oc_chat",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+        )
+        first = MessageEvent(
+            text="Forwarded thread\n- Alice: Please review PR-128",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_forward",
+        )
+        first._feishu_relation_kind = "merge_forward"
+        question = SimpleNamespace(
+            message_id="om_question",
+            message_type="text",
+            content=json.dumps({"text": "What should I reply?"}),
+            chat_type="p2p",
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            mentions=None,
+        )
+
+        async def _run() -> None:
+            await adapter._enqueue_text_event(first)
+            key = adapter._text_batch_key(first)
+            first_task = adapter._pending_text_batch_tasks[key]
+            lock = adapter._get_text_batch_inbound_lock(key)
+            await lock.acquire()
+            try:
+                raw_task = asyncio.create_task(adapter._handle_message_event_data(_data(question)))
+                await asyncio.sleep(0)
+                self.assertEqual(adapter._pending_text_batch_inflight_counts.get(key), 1)
+                await asyncio.sleep(0.03)
+                adapter.handle_message.assert_not_awaited()
+            finally:
+                lock.release()
+            await raw_task
+            pending = {first_task, *adapter._pending_text_batch_tasks.values()}
+            await asyncio.gather(*pending, return_exceptions=True)
+            self.assertNotIn(key, adapter._text_batch_inbound_locks)
+
+        asyncio.run(_run())
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(
+            event.text,
+            "Forwarded thread\n- Alice: Please review PR-128\nWhat should I reply?",
+        )
+        self.assertEqual(event.message_id, "om_question")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_text_batch_preserves_raw_order_when_followup_normalizes_first(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter.handle_message = AsyncMock()
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter.get_chat_info = AsyncMock(return_value={"name": "Feishu DM", "type": "dm"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "ou_user", "user_name": "张三", "user_id_alt": "on_union"}
+        )
+        adapter._text_batch_delay_seconds = 10.0
+        adapter._text_batch_split_delay_seconds = 10.0
+        adapter._text_batch_inflight_poll_seconds = 0.01
+
+        sender_id = SimpleNamespace(user_id="ou_user", open_id="ou_open", union_id="on_union")
+
+        def _data(message):
+            return SimpleNamespace(event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id)))
+
+        forward = SimpleNamespace(
+            message_id="om_forward",
+            message_type="merge_forward",
+            content="Merged and Forwarded Message",
+            chat_type="p2p",
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            mentions=None,
+        )
+        question = SimpleNamespace(
+            message_id="om_question",
+            message_type="text",
+            content=json.dumps({"text": "What should I reply?"}),
+            chat_type="p2p",
+            chat_id="oc_chat",
+            thread_id=None,
+            parent_id=None,
+            upper_message_id=None,
+            mentions=None,
+        )
+
+        async def _extract(message):
+            if message.message_id == "om_forward":
+                await asyncio.sleep(0.03)
+                return "Forwarded thread\n- Alice: Please review PR-128", MessageType.TEXT, [], [], []
+            return "What should I reply?", MessageType.TEXT, [], [], []
+
+        adapter._extract_message_content = AsyncMock(side_effect=_extract)
+
+        async def _run() -> None:
+            first = asyncio.create_task(adapter._handle_message_event_data(_data(forward)))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(adapter._handle_message_event_data(_data(question)))
+            await asyncio.gather(first, second)
+            self.assertEqual(len(adapter._pending_text_batches), 1)
+            key, pending_event = next(iter(adapter._pending_text_batches.items()))
+            self.assertEqual(
+                pending_event.text,
+                "Forwarded thread\n- Alice: Please review PR-128\nWhat should I reply?",
+            )
+            await adapter._flush_text_batch_now(key)
+            pending = list(adapter._pending_text_batch_tasks.values())
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run(_run())
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(
+            event.text,
+            "Forwarded thread\n- Alice: Please review PR-128\nWhat should I reply?",
+        )
+        self.assertEqual(event.message_id, "om_question")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_merge_forward_and_reply_to_forward_text_merge_in_dm(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._schedule_text_batch_flush = Mock()
+        adapter._handle_message_with_guards = AsyncMock()
+        source = SessionSource(
+            platform=adapter.platform,
+            chat_id="oc_chat",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+        )
+        forward = MessageEvent(
+            text="[Merged forward message]",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_forward",
+        )
+        forward._feishu_relation_kind = "merge_forward"
+        question = MessageEvent(
+            text="What should I reply?",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_question",
+            reply_to_message_id="om_forward",
+            reply_to_text="[Merged forward message]",
+        )
+
+        async def _run() -> None:
+            await adapter._dispatch_inbound_event(forward)
+            await adapter._dispatch_inbound_event(question)
+
+        asyncio.run(_run())
+
+        adapter._handle_message_with_guards.assert_not_awaited()
+        key = adapter._text_batch_key(forward)
+        pending = adapter._pending_text_batches[key]
+        self.assertEqual(pending.text, "[Merged forward message]\nWhat should I reply?")
+        self.assertEqual(pending.message_id, "om_question")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_dm_text_batch_merges_same_sender_chat_thread_despite_different_reply_context(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._schedule_text_batch_flush = Mock()
+        adapter._handle_message_with_guards = AsyncMock()
+        source = SessionSource(
+            platform=adapter.platform,
+            chat_id="oc_dm",
+            chat_name="Feishu DM",
+            chat_type="dm",
+            user_id="ou_user",
+            user_name="张三",
+            thread_id="omt_1",
+        )
+        first = MessageEvent(
+            text="first ordinary text",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_1",
+            reply_to_message_id="om_parent_a",
+            reply_to_text="parent A",
+        )
+        second = MessageEvent(
+            text="second ordinary text",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_2",
+            reply_to_message_id="om_parent_b",
+            reply_to_text="parent B",
+        )
+
+        async def _run() -> None:
+            await adapter._enqueue_text_event(first)
+            await adapter._enqueue_text_event(second)
+
+        asyncio.run(_run())
+
+        adapter._handle_message_with_guards.assert_not_awaited()
+        key = adapter._text_batch_key(first)
+        pending = adapter._pending_text_batches[key]
+        self.assertEqual(pending.text, "first ordinary text\nsecond ordinary text")
+        self.assertEqual(pending.message_id, "om_2")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_dm_text_batch_does_not_merge_different_sender_chat_or_thread(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import SessionSource
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._schedule_text_batch_flush = Mock()
+        adapter._handle_message_with_guards = AsyncMock()
+
+        def _source(*, user_id="ou_user", chat_id="oc_dm", thread_id="omt_1"):
+            return SessionSource(
+                platform=adapter.platform,
+                chat_id=chat_id,
+                chat_name="Feishu DM",
+                chat_type="dm",
+                user_id=user_id,
+                user_name=user_id,
+                thread_id=thread_id,
+            )
+
+        first = MessageEvent(text="first", message_type=MessageType.TEXT, source=_source(), message_id="om_1")
+        different_sender = MessageEvent(
+            text="different sender",
+            message_type=MessageType.TEXT,
+            source=_source(user_id="ou_other"),
+            message_id="om_2",
+        )
+        different_chat = MessageEvent(
+            text="different chat",
+            message_type=MessageType.TEXT,
+            source=_source(chat_id="oc_other"),
+            message_id="om_3",
+        )
+        different_thread = MessageEvent(
+            text="different thread",
+            message_type=MessageType.TEXT,
+            source=_source(thread_id="omt_2"),
+            message_id="om_4",
+        )
+
+        async def _run() -> None:
+            await adapter._enqueue_text_event(first)
+            await adapter._enqueue_text_event(different_sender)
+            await adapter._enqueue_text_event(different_chat)
+            await adapter._enqueue_text_event(different_thread)
+
+        asyncio.run(_run())
+
+        flushed = [call.args[0].text for call in adapter._handle_message_with_guards.await_args_list]
+        self.assertEqual(flushed, ["first"])
+        sender_key = adapter._text_batch_key(different_sender)
+        chat_key = adapter._text_batch_key(different_chat)
+        thread_key = adapter._text_batch_key(different_thread)
+        self.assertEqual(adapter._pending_text_batches[sender_key].text, "different sender")
+        self.assertEqual(adapter._pending_text_batches[chat_key].text, "different chat")
+        self.assertEqual(adapter._pending_text_batches[thread_key].text, "different thread")
 
     @patch.dict(
         os.environ,
@@ -5149,6 +5760,42 @@ class TestFeishuFetchMessageText(unittest.TestCase):
         # The rendered text should still have the bot name substituted.
         result = asyncio.run(adapter._fetch_message_text("m_parent"))
         self.assertEqual(result, "@Hermes hi")
+
+    def test_fetch_message_text_expands_merge_forward_children_from_items(self):
+        adapter = self._build_adapter()
+
+        merge_id = "om_merge_forward"
+        parent = SimpleNamespace(
+            body=SimpleNamespace(content="Merged and Forwarded Message"),
+            msg_type="merge_forward",
+            mentions=None,
+            message_id=merge_id,
+        )
+        child_a = SimpleNamespace(
+            body=SimpleNamespace(content=json.dumps({"text": "哈哈哈"})),
+            msg_type="text",
+            mentions=None,
+            sender=SimpleNamespace(id="ou_6289"),
+            upper_message_id=merge_id,
+        )
+        child_b = SimpleNamespace(
+            body=SimpleNamespace(content=json.dumps({"text": "这次充够了8小时"})),
+            msg_type="text",
+            mentions=None,
+            sender=SimpleNamespace(id="ou_de3"),
+            upper_message_id=merge_id,
+        )
+        response = Mock()
+        response.success = Mock(return_value=True)
+        response.data = SimpleNamespace(items=[parent, child_a, child_b])
+        adapter._client.im.v1.message.get = Mock(return_value=response)
+
+        result = asyncio.run(adapter._fetch_message_text(merge_id))
+
+        self.assertIn("哈哈哈", result)
+        self.assertIn("这次充够了8小时", result)
+        self.assertNotEqual(result, "- Merged and Forwarded Message")
+        self.assertNotEqual(result, "Merged and Forwarded Message")
 
     def test_build_mentions_map_string_id_shape(self):
         """_build_mentions_map accepts the reply-history shape (id as str +

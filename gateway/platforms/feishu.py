@@ -200,6 +200,8 @@ _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
 _DEFAULT_TEXT_BATCH_MAX_MESSAGES = 8
 _DEFAULT_TEXT_BATCH_MAX_CHARS = 4000
+_TEXT_BATCH_INFLIGHT_POLL_SECONDS = 0.05
+_TEXT_BATCH_INFLIGHT_MAX_WAIT_SECONDS = 5.0
 _DEFAULT_MEDIA_BATCH_DELAY_SECONDS = 0.8
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
 _FEISHU_GROUP_HISTORY_SIZE = 100
@@ -274,6 +276,13 @@ _ONBOARD_REQUEST_TIMEOUT_S = 10
 
 FALLBACK_POST_TEXT = "[Rich text message]"
 FALLBACK_FORWARD_TEXT = "[Merged forward message]"
+_FEISHU_MERGE_FORWARD_PLACEHOLDERS = frozenset(
+    {
+        FALLBACK_FORWARD_TEXT,
+        "Merged and Forwarded Message",
+        "- Merged and Forwarded Message",
+    }
+)
 FALLBACK_SHARE_CHAT_TEXT = "[Shared chat]"
 FALLBACK_INTERACTIVE_TEXT = "[Interactive message]"
 FALLBACK_IMAGE_TEXT = "[Image]"
@@ -425,6 +434,7 @@ class FeishuBatchState:
     events: Dict[str, MessageEvent] = field(default_factory=dict)
     tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
+    inflight_counts: Dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -876,13 +886,17 @@ def _load_feishu_payload(raw_content: str) -> Dict[str, Any]:
 
 
 def _normalize_merge_forward_message(payload: Dict[str, Any]) -> FeishuNormalizedMessage:
+    forward_payloads = _merge_forward_payload_candidates(payload)
     title = _first_non_empty_text(
         payload.get("title"),
         payload.get("summary"),
         payload.get("preview"),
-        _find_first_text(payload, keys=("title", "summary", "preview", "description")),
+        *(
+            _find_first_text(item, keys=("title", "summary", "preview", "description"))
+            for item in forward_payloads
+        ),
     )
-    entries = _collect_forward_entries(payload)
+    entries = _collect_forward_entries(forward_payloads)
     lines: List[str] = []
     if title:
         lines.append(title)
@@ -894,6 +908,10 @@ def _normalize_merge_forward_message(payload: Dict[str, Any]) -> FeishuNormalize
         relation_kind="merge_forward",
         metadata={"entry_count": len(entries), "title": title},
     )
+
+
+def _is_merge_forward_placeholder(text: str) -> bool:
+    return (text or "").strip() in _FEISHU_MERGE_FORWARD_PLACEHOLDERS
 
 
 def _normalize_share_chat_message(payload: Dict[str, Any]) -> FeishuNormalizedMessage:
@@ -957,12 +975,35 @@ def _normalize_interactive_message(message_type: str, payload: Dict[str, Any]) -
 # ---------------------------------------------------------------------------
 
 
-def _collect_forward_entries(payload: Dict[str, Any]) -> List[str]:
+def _merge_forward_payload_candidates(payload: Dict[str, Any]) -> List[Any]:
+    candidates: List[Any] = [payload]
+    content = payload.get("content")
+    parsed_content = _try_load_json_object(content) if isinstance(content, str) else None
+    if parsed_content is not None:
+        candidates.append(parsed_content)
+    elif isinstance(content, (dict, list)):
+        candidates.append(content)
+    return candidates
+
+
+def _try_load_json_object(value: str) -> Optional[Any]:
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return parsed if isinstance(parsed, (dict, list)) else None
+
+
+def _collect_forward_entries(payloads: Sequence[Any]) -> List[str]:
     candidates: List[Any] = []
-    for key in ("messages", "items", "message_list", "records", "content"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            candidates.extend(value)
+    for payload in payloads:
+        raw_items = _collect_forward_raw_items(payload)
+        if raw_items:
+            candidates.extend(raw_items)
+        elif isinstance(payload, dict):
+            candidates.append(payload)
+        elif isinstance(payload, list):
+            candidates.extend(payload)
     entries: List[str] = []
     for item in candidates:
         if not isinstance(item, dict):
@@ -970,21 +1011,35 @@ def _collect_forward_entries(payload: Dict[str, Any]) -> List[str]:
             if text:
                 entries.append(f"- {text}")
             continue
+        nested_entries = _collect_nested_forward_entries(item)
+        if nested_entries:
+            entries.extend(nested_entries)
+            continue
+        sender_obj = item.get("sender") if isinstance(item.get("sender"), dict) else {}
         sender = _first_non_empty_text(
             item.get("sender_name"),
             item.get("user_name"),
+            sender_obj.get("name"),
+            sender_obj.get("sender_name"),
+            sender_obj.get("user_name"),
             item.get("sender"),
             item.get("name"),
         )
         nested_type = str(item.get("message_type", "") or item.get("msg_type", "")).strip().lower()
         if nested_type == "post":
-            body = parse_feishu_post_payload(item.get("content") or item).text_content
+            body_payload = item.get("content")
+            if not body_payload and isinstance(item.get("body"), dict):
+                body_payload = item["body"].get("content") or item["body"]
+            body = parse_feishu_post_payload(body_payload or item).text_content
         else:
+            body_obj = item.get("body") if isinstance(item.get("body"), dict) else {}
             body = _first_non_empty_text(
                 item.get("text"),
                 item.get("summary"),
                 item.get("preview"),
                 item.get("content"),
+                body_obj.get("text"),
+                body_obj.get("content"),
                 _find_first_text(item, keys=("text", "content", "summary", "preview", "title")),
             )
         body = _normalize_feishu_text(body)
@@ -993,6 +1048,39 @@ def _collect_forward_entries(payload: Dict[str, Any]) -> List[str]:
         elif body:
             entries.append(f"- {body}")
     return _unique_lines(entries)
+
+
+def _collect_forward_raw_items(value: Any) -> List[Any]:
+    items: List[Any] = []
+    if isinstance(value, str):
+        parsed_value = _try_load_json_object(value)
+        return _collect_forward_raw_items(parsed_value) if parsed_value is not None else []
+    if isinstance(value, list):
+        return list(value)
+    if not isinstance(value, dict):
+        return []
+    for key in ("messages", "items", "message_list", "records"):
+        nested = value.get(key)
+        if isinstance(nested, str):
+            nested = _try_load_json_object(nested)
+        if isinstance(nested, list):
+            items.extend(nested)
+        elif isinstance(nested, dict):
+            items.extend(_collect_forward_raw_items(nested))
+    content = value.get("content")
+    if isinstance(content, (dict, list, str)):
+        items.extend(_collect_forward_raw_items(content))
+    return items
+
+
+def _collect_nested_forward_entries(item: Dict[str, Any]) -> List[str]:
+    body = item.get("body") if isinstance(item.get("body"), dict) else {}
+    nested_sources = [body.get("content"), item.get("content")]
+    for source in nested_sources:
+        nested_items = _collect_forward_raw_items(source)
+        if nested_items:
+            return _collect_forward_entries(nested_items)
+    return []
 
 
 def _collect_card_lines(payload: Any) -> List[str]:
@@ -1393,6 +1481,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._pending_text_batches = self._text_batch_state.events
         self._pending_text_batch_tasks = self._text_batch_state.tasks
         self._pending_text_batch_counts = self._text_batch_state.counts
+        self._pending_text_batch_inflight_counts = self._text_batch_state.inflight_counts
+        self._text_batch_inflight_poll_seconds = _TEXT_BATCH_INFLIGHT_POLL_SECONDS
+        self._text_batch_inflight_max_wait_seconds = _TEXT_BATCH_INFLIGHT_MAX_WAIT_SECONDS
+        self._text_batch_inbound_locks: Dict[str, asyncio.Lock] = {}
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
@@ -1657,6 +1749,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _reset_batch_buffers(self) -> None:
         self._pending_text_batches.clear()
         self._pending_text_batch_counts.clear()
+        self._pending_text_batch_inflight_counts.clear()
         self._pending_media_batches.clear()
 
     def _disable_websocket_auto_reconnect(self) -> None:
@@ -2481,9 +2574,47 @@ class FeishuAdapter(BasePlatformAdapter):
         if self._is_self_sent_bot_message(event):
             logger.debug("[Feishu] Dropping self-sent bot event: %s", message_id)
             return
-        
+
         chat_type = getattr(message, "chat_type", "p2p")
         chat_id = getattr(message, "chat_id", "") or ""
+        inflight_text_batch_key = self._raw_text_batch_key(message, sender_id, chat_type)
+        if inflight_text_batch_key:
+            self._begin_text_batch_inflight(inflight_text_batch_key)
+            lock = self._get_text_batch_inbound_lock(inflight_text_batch_key)
+            try:
+                async with lock:
+                    await self._handle_message_event_data_after_intake(
+                        data=data,
+                        message=message,
+                        sender_id=sender_id,
+                        chat_type=chat_type,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                    )
+            finally:
+                self._end_text_batch_inflight(inflight_text_batch_key)
+                self._maybe_cleanup_text_batch_inbound_lock(inflight_text_batch_key, lock)
+            return
+
+        await self._handle_message_event_data_after_intake(
+            data=data,
+            message=message,
+            sender_id=sender_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            message_id=message_id,
+        )
+
+    async def _handle_message_event_data_after_intake(
+        self,
+        *,
+        data: Any,
+        message: Any,
+        sender_id: Any,
+        chat_type: str,
+        chat_id: str,
+        message_id: str,
+    ) -> None:
         extracted_content = None
         sender_profile = None
         if chat_type != "p2p":
@@ -3092,6 +3223,9 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             timestamp=datetime.now(),
         )
+        normalized._feishu_relation_kind = str(  # type: ignore[attr-defined]
+            getattr(message, "message_type", "") or ""
+        ).strip().lower()
         if history_context:
             normalized._feishu_group_history_signature = f"{message_id}:{text}"  # type: ignore[attr-defined]
         await self._dispatch_inbound_event(normalized)
@@ -3395,6 +3529,78 @@ class FeishuAdapter(BasePlatformAdapter):
     # Text batching
     # =========================================================================
 
+    def _raw_text_batch_key(self, message: Any, sender_id: Any, chat_type: str) -> str:
+        """Return the eventual text-batch key for a raw Feishu event, if batchable."""
+        if not self._raw_message_may_enter_text_batch(message):
+            return ""
+        chat_id = str(getattr(message, "chat_id", "") or "")
+        if not chat_id:
+            return ""
+
+        from gateway.session import SessionSource, build_session_key
+
+        raw_chat_type = str(chat_type or "").strip().lower()
+        source_chat_type = "dm" if raw_chat_type in {"p2p", "dm"} else "group"
+        source = SessionSource(
+            platform=self.platform,
+            chat_id=chat_id,
+            chat_name=chat_id,
+            chat_type=source_chat_type,
+            user_id=getattr(sender_id, "user_id", None) or getattr(sender_id, "open_id", None) or None,
+            thread_id=getattr(message, "thread_id", None) or None,
+            user_id_alt=getattr(sender_id, "union_id", None) or None,
+        )
+        return build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
+    def _get_text_batch_inbound_lock(self, key: str) -> asyncio.Lock:
+        lock = self._text_batch_inbound_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._text_batch_inbound_locks[key] = lock
+        return lock
+
+    def _maybe_cleanup_text_batch_inbound_lock(self, key: str, lock: Optional[asyncio.Lock] = None) -> None:
+        if self._pending_text_batch_inflight_counts.get(key):
+            return
+        if key in self._pending_text_batches or key in self._pending_text_batch_tasks:
+            return
+        current_lock = self._text_batch_inbound_locks.get(key)
+        if current_lock is None or (lock is not None and current_lock is not lock):
+            return
+        waiters = getattr(current_lock, "_waiters", None)
+        if current_lock.locked() or (waiters and any(not waiter.done() for waiter in waiters)):
+            return
+        self._text_batch_inbound_locks.pop(key, None)
+
+    @staticmethod
+    def _raw_message_may_enter_text_batch(message: Any) -> bool:
+        raw_type = str(getattr(message, "message_type", "") or "").strip().lower()
+        if raw_type == "merge_forward":
+            return True
+        if raw_type not in {"text", "post"}:
+            return False
+        if raw_type == "text":
+            payload = _load_feishu_payload(getattr(message, "content", "") or "")
+            text = _normalize_feishu_text(_first_non_empty_text(payload.get("text"), payload.get("content")))
+            if text.startswith("/"):
+                return False
+        return True
+
+    def _begin_text_batch_inflight(self, key: str) -> None:
+        self._pending_text_batch_inflight_counts[key] = self._pending_text_batch_inflight_counts.get(key, 0) + 1
+
+    def _end_text_batch_inflight(self, key: str) -> None:
+        count = self._pending_text_batch_inflight_counts.get(key, 0)
+        if count <= 1:
+            self._pending_text_batch_inflight_counts.pop(key, None)
+        else:
+            self._pending_text_batch_inflight_counts[key] = count - 1
+        self._maybe_cleanup_text_batch_inbound_lock(key)
+
     def _text_batch_key(self, event: MessageEvent) -> str:
         """Return the session-scoped key used for Feishu text aggregation."""
         from gateway.session import build_session_key
@@ -3444,14 +3650,26 @@ class FeishuAdapter(BasePlatformAdapter):
             if existing_sender_ids and incoming_sender_ids
             else existing_sender_ids == incoming_sender_ids
         )
-        return (
+        same_context = (
             same_sender
             and existing.source.chat_id == incoming.source.chat_id
-            and existing.reply_to_message_id == incoming.reply_to_message_id
-            and existing.reply_to_text == incoming.reply_to_text
             and existing.source.thread_id == incoming.source.thread_id
             and getattr(existing, "_feishu_group_history_signature", None)
             == getattr(incoming, "_feishu_group_history_signature", None)
+        )
+        if not same_context:
+            return False
+
+        if getattr(existing.source, "chat_type", "") == "dm" and getattr(incoming.source, "chat_type", "") == "dm":
+            return True
+
+        if existing.reply_to_message_id == incoming.reply_to_message_id and existing.reply_to_text == incoming.reply_to_text:
+            return True
+
+        return (
+            getattr(existing, "_feishu_relation_kind", "") == "merge_forward"
+            and bool(existing.message_id)
+            and incoming.reply_to_message_id == existing.message_id
         )
 
     async def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -3523,21 +3741,40 @@ class FeishuAdapter(BasePlatformAdapter):
             # a continuation is almost certain — wait longer.
             pending = self._pending_text_batches.get(key)
             last_len = getattr(pending, "_last_chunk_len", 0) if pending else 0
-            if last_len >= self._SPLIT_THRESHOLD:
+            relation_kind = getattr(pending, "_feishu_relation_kind", "") if pending else ""
+            if last_len >= self._SPLIT_THRESHOLD or relation_kind == "merge_forward":
                 delay = self._text_batch_split_delay_seconds
             else:
                 delay = self._text_batch_delay_seconds
             await asyncio.sleep(delay)
+            await self._wait_for_text_batch_inflight(key)
             await self._flush_text_batch_now(key)
         finally:
             if self._pending_text_batch_tasks.get(key) is current_task:
                 self._pending_text_batch_tasks.pop(key, None)
+            self._maybe_cleanup_text_batch_inbound_lock(key)
+
+    async def _wait_for_text_batch_inflight(self, key: str) -> None:
+        """Let raw same-key text events finish normalization before a timed flush."""
+        if not self._pending_text_batch_inflight_counts.get(key):
+            return
+        max_wait = max(0.0, float(self._text_batch_inflight_max_wait_seconds))
+        if max_wait <= 0:
+            return
+        poll = max(0.01, float(self._text_batch_inflight_poll_seconds))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max_wait
+        while self._pending_text_batch_inflight_counts.get(key, 0) > 0 and loop.time() < deadline:
+            await asyncio.sleep(min(poll, max(0.01, deadline - loop.time())))
+        if self._pending_text_batch_inflight_counts.get(key, 0) > 0:
+            logger.debug("[Feishu] Text batch %s still has in-flight events after %.1fs", key, max_wait)
 
     async def _flush_text_batch_now(self, key: str) -> None:
         """Dispatch the current text batch immediately."""
         event = self._pending_text_batches.pop(key, None)
         self._pending_text_batch_counts.pop(key, None)
         if not event:
+            self._maybe_cleanup_text_batch_inbound_lock(key)
             return
         logger.info(
             "[Feishu] Flushing text batch %s (%d chars)",
@@ -3545,6 +3782,7 @@ class FeishuAdapter(BasePlatformAdapter):
             len(event.text or ""),
         )
         await self._handle_message_with_guards(event)
+        self._maybe_cleanup_text_batch_inbound_lock(key)
 
     # =========================================================================
     # Message content extraction and resource download
@@ -3570,6 +3808,11 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         inbound_type = self._resolve_normalized_message_type(normalized, media_types)
         text = normalized.text_content
+
+        if normalized.raw_type == "merge_forward" and _is_merge_forward_placeholder(text) and message_id:
+            fetched_text = await self._fetch_message_text(message_id)
+            if fetched_text and not _is_merge_forward_placeholder(fetched_text):
+                text = fetched_text
 
         if (
             inbound_type in {MessageType.DOCUMENT, MessageType.AUDIO, MessageType.VIDEO, MessageType.PHOTO}
@@ -3947,6 +4190,24 @@ class FeishuAdapter(BasePlatformAdapter):
                 raw_content=raw_content,
                 mentions=parent_mentions,
             )
+            if msg_type == "merge_forward" and _is_merge_forward_placeholder(text or ""):
+                child_lines: List[str] = []
+                for child in items[1:]:
+                    if getattr(child, "upper_message_id", None) != message_id:
+                        continue
+                    child_body = getattr(child, "body", None)
+                    child_text = self._extract_text_from_raw_content(
+                        msg_type=getattr(child, "msg_type", "") or "",
+                        raw_content=getattr(child_body, "content", "") or "",
+                        mentions=getattr(child, "mentions", None),
+                    )
+                    if not child_text:
+                        continue
+                    sender = getattr(child, "sender", None)
+                    sender_id = str(getattr(sender, "id", "") or "").strip()
+                    child_lines.append(f"- {sender_id}: {child_text}" if sender_id else f"- {child_text}")
+                if child_lines:
+                    text = "\n".join(child_lines)
             self._message_text_cache[message_id] = text
             return text
         except Exception:
