@@ -82,8 +82,9 @@ def _global_allow_private_urls() -> bool:
 
     Checks (in priority order):
     1. ``HERMES_ALLOW_PRIVATE_URLS`` env var  (``true``/``1``/``yes``)
-    2. ``security.allow_private_urls`` in config.yaml
-    3. ``browser.allow_private_urls`` in config.yaml  (legacy / backward compat)
+    2. ``security.allow_private_urls`` in config.yaml, when explicitly present
+    3. ``browser.allow_private_urls`` in config.yaml, only as a legacy fallback
+       when the security setting is absent
 
     Result is cached for the process lifetime.
     """
@@ -107,19 +108,23 @@ def _global_allow_private_urls() -> bool:
     try:
         from hermes_cli.config import read_raw_config
         cfg = read_raw_config()
-        # security.allow_private_urls (preferred)
+        # security.allow_private_urls is the authoritative config key.  When it
+        # is present, even with a falsey value, do not fall back to the legacy
+        # browser-scoped key.
         sec = cfg.get("security", {})
-        if isinstance(sec, dict) and is_truthy_value(
-            sec.get("allow_private_urls"), default=False
-        ):
-            _cached_allow_private = True
+        if isinstance(sec, dict) and "allow_private_urls" in sec:
+            _cached_allow_private = is_truthy_value(
+                sec.get("allow_private_urls"), default=False
+            )
             return _cached_allow_private
-        # browser.allow_private_urls (legacy fallback)
+
+        # browser.allow_private_urls is retained only for older configs that
+        # predate the security section.
         browser = cfg.get("browser", {})
-        if isinstance(browser, dict) and is_truthy_value(
-            browser.get("allow_private_urls"), default=False
-        ):
-            _cached_allow_private = True
+        if isinstance(browser, dict) and "allow_private_urls" in browser:
+            _cached_allow_private = is_truthy_value(
+                browser.get("allow_private_urls"), default=False
+            )
             return _cached_allow_private
     except Exception:
         # Config unavailable (e.g. tests, early import) — keep default
@@ -152,6 +157,62 @@ def _allows_private_ip_resolution(hostname: str, scheme: str) -> bool:
     return scheme == "https" and hostname in _TRUSTED_PRIVATE_IP_HOSTS
 
 
+def _canonical_ip_for_blocking(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Return the address form used for always-block comparisons."""
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        return ip.ipv4_mapped
+    return ip
+
+
+def _is_always_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True for metadata/link-local addresses blocked regardless of config."""
+    ip = _canonical_ip_for_blocking(ip)
+    if ip in _ALWAYS_BLOCKED_IPS:
+        return True
+    return any(ip.version == net.version and ip in net for net in _ALWAYS_BLOCKED_NETWORKS)
+
+
+def is_always_blocked_url(url: str) -> bool:
+    """Return True for URL targets that config must never allow.
+
+    This is narrower than ``is_safe_url``: ordinary private/internal targets are
+    not always-blocked, but cloud metadata hostnames/IPs and the IPv4
+    169.254.0.0/16 link-local range are.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+        if not hostname:
+            return False
+
+        if hostname in _BLOCKED_HOSTNAMES:
+            logger.warning("Blocked request to internal hostname: %s", hostname)
+            return True
+
+        ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+        try:
+            ips.append(ipaddress.ip_address(hostname))
+        except ValueError:
+            try:
+                addr_info = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+            except socket.gaierror:
+                return False
+            for _family, _, _, _, sockaddr in addr_info:
+                try:
+                    ips.append(ipaddress.ip_address(sockaddr[0]))
+                except ValueError:
+                    continue
+
+        for ip in ips:
+            if _is_always_blocked_ip(ip):
+                logger.warning("Blocked request to cloud metadata address: %s -> %s", hostname, ip)
+                return True
+        return False
+    except Exception as exc:
+        logger.warning("URL always-block check error for %s: %s", url, exc)
+        return False
+
+
 def is_safe_url(url: str) -> bool:
     """Return True if the URL target is not a private/internal address.
 
@@ -159,7 +220,9 @@ def is_safe_url(url: str) -> bool:
     Fails closed: DNS errors and unexpected exceptions block the request.
 
     When ``security.allow_private_urls`` is enabled (or the env var
-    ``HERMES_ALLOW_PRIVATE_URLS=true``), private-IP blocking is skipped.
+    ``HERMES_ALLOW_PRIVATE_URLS=true``), private-IP blocking is skipped. Legacy
+    ``browser.allow_private_urls`` is honored only if the security setting is
+    absent.
     Cloud metadata endpoints (169.254.169.254, metadata.google.internal)
     remain blocked regardless — they are never legitimate agent targets.
     """
@@ -196,8 +259,8 @@ def is_safe_url(url: str) -> bool:
             except ValueError:
                 continue
 
-            # Always block cloud metadata IPs and link-local, even with toggle on
-            if ip in _ALWAYS_BLOCKED_IPS or any(ip in net for net in _ALWAYS_BLOCKED_NETWORKS):
+            # Always block cloud metadata IPs and IPv4 link-local, even with toggle on
+            if _is_always_blocked_ip(ip):
                 logger.warning(
                     "Blocked request to cloud metadata address: %s -> %s",
                     hostname, ip_str,
@@ -213,7 +276,7 @@ def is_safe_url(url: str) -> bool:
 
         if allow_all_private:
             logger.debug(
-                "Allowing private/internal resolution (security.allow_private_urls=true): %s",
+                "Allowing private/internal resolution (allow_private_urls enabled): %s",
                 hostname,
             )
         elif allow_private_ip:

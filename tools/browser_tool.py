@@ -69,7 +69,6 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 from agent.auxiliary_client import call_llm
 from hermes_constants import get_hermes_home
-from utils import is_truthy_value
 from hermes_cli.config import cfg_get
 
 try:
@@ -79,8 +78,10 @@ except Exception:
 
 try:
     from tools.url_safety import is_safe_url as _is_safe_url
+    from tools.url_safety import is_always_blocked_url as _is_always_blocked_url
 except Exception:
     _is_safe_url = lambda url: False  # noqa: E731 — fail-closed: block all if safety module unavailable
+    _is_always_blocked_url = lambda url: False  # noqa: E731 — safety module unavailable
 from tools.browser_providers.base import CloudBrowserProvider
 from tools.browser_providers.browserbase import BrowserbaseProvider
 from tools.browser_providers.browser_use import BrowserUseProvider
@@ -657,8 +658,6 @@ _PROVIDER_REGISTRY: Dict[str, type] = {
 
 _cached_cloud_provider: Optional[CloudBrowserProvider] = None
 _cloud_provider_resolved = False
-_allow_private_urls_resolved = False
-_cached_allow_private_urls: Optional[bool] = None
 _cached_agent_browser: Optional[str] = None
 _agent_browser_resolved = False
 
@@ -885,31 +884,6 @@ def _last_session_key(task_id: str) -> str:
     if task_id is None:
         task_id = "default"
     return _last_active_session_key.get(task_id, task_id)
-
-
-def _allow_private_urls() -> bool:
-    """Return whether the browser is allowed to navigate to private/internal addresses.
-
-    Reads ``config["browser"]["allow_private_urls"]`` once and caches the result
-    for the process lifetime.  Defaults to ``False`` (SSRF protection active).
-    """
-    global _cached_allow_private_urls, _allow_private_urls_resolved
-    if _allow_private_urls_resolved:
-        return _cached_allow_private_urls
-
-    _allow_private_urls_resolved = True
-    _cached_allow_private_urls = False  # safe default
-    try:
-        from hermes_cli.config import read_raw_config
-        cfg = read_raw_config()
-        browser_cfg = cfg.get("browser", {})
-        if isinstance(browser_cfg, dict):
-            _cached_allow_private_urls = is_truthy_value(
-                browser_cfg.get("allow_private_urls"), default=False
-            )
-    except Exception as e:
-        logger.debug("Could not read allow_private_urls from config: %s", e)
-    return _cached_allow_private_urls
 
 
 def _socket_safe_tmpdir() -> str:
@@ -2014,16 +1988,23 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
     # the terminal tool.  Also skipped when hybrid routing will auto-spawn a
     # local Chromium sidecar for this URL (cloud provider configured +
     # private URL + ``browser.auto_local_for_private_urls`` enabled) — the
-    # cloud provider never sees the URL in that case.  Can also be opted
-    # out globally via ``browser.allow_private_urls`` in config.
+    # cloud provider never sees the URL in that case.  For cloud navigations
+    # that do run the SSRF check, the shared URL-safety layer owns
+    # allow_private_urls precedence and always-block metadata rules.
     effective_task_id = task_id or "default"
     nav_session_key = _navigation_session_key(effective_task_id, url)
     auto_local_this_nav = _is_local_sidecar_key(nav_session_key)
+    cloud_ssrf_applies = not _is_local_backend()
+
+    if cloud_ssrf_applies and _is_always_blocked_url(url):
+        return json.dumps({
+            "success": False,
+            "error": "Blocked: URL targets a private or internal address",
+        })
 
     if (
-        not _is_local_backend()
+        cloud_ssrf_applies
         and not auto_local_this_nav
-        and not _allow_private_urls()
         and not _is_safe_url(url)
     ):
         return json.dumps({
@@ -2082,10 +2063,17 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Skipped for local backends (same rationale as the pre-nav check),
         # and for the hybrid local sidecar (we're already on a local browser
         # hitting a private URL by design).
+        if cloud_ssrf_applies and final_url and final_url != url and _is_always_blocked_url(final_url):
+            # Navigate away to a blank page to prevent snapshot leaks
+            _run_browser_command(nav_session_key, "open", ["about:blank"], timeout=10)
+            return json.dumps({
+                "success": False,
+                "error": "Blocked: redirect landed on a private/internal address",
+            })
+
         if (
-            not _is_local_backend()
+            cloud_ssrf_applies
             and not auto_local_this_nav
-            and not _allow_private_urls()
             and final_url and final_url != url and not _is_safe_url(final_url)
         ):
             # Navigate away to a blank page to prevent snapshot leaks

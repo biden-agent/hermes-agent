@@ -111,14 +111,16 @@ browser:
 
 With auto-routing disabled, private URLs are rejected with
 `"Blocked: URL targets a private or internal address"` unless you also set
-`browser.allow_private_urls: true` (which lets the cloud provider attempt them —
-usually won't work since Browserbase etc. can't reach your LAN).
+`security.allow_private_urls: true` (which lets the cloud provider attempt them —
+usually won't work since Browserbase etc. can't reach your LAN). Older configs
+that only set `browser.allow_private_urls: true` are still honored when
+`security.allow_private_urls` is absent.
 
 Requirements: the local sidecar uses the same `agent-browser` CLI as pure local
 mode, so you need it installed (`hermes setup tools → Browser Automation`
 auto-installs it). Post-navigation redirects from a public URL onto a private
-address are still blocked (you can't use a redirect-to-internal trick to reach
-your LAN through the public path).
+address are blocked unless private URLs are explicitly allowed. Cloud metadata
+and IPv4 link-local targets remain blocked either way.
 
 ### Camofox local mode
 

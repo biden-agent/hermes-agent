@@ -197,10 +197,14 @@ CURL_SCHEMA = {
     "name": "curl",
     "description": (
         "Perform a safe HTTP/HTTPS request and return status, headers, and body text. "
-        "Only public http:// and https:// URLs are allowed; local file schemes, "
-        "localhost, private networks, link-local addresses, and cloud metadata endpoints are blocked "
-        "unless security.allow_private_urls or browser.allow_private_urls is enabled. "
-        "Cloud metadata endpoints remain blocked even when private URLs are allowed. "
+        "Only http:// and https:// schemes are allowed; local file and other URL schemes are blocked. "
+        "By default, localhost, private/internal networks, CGNAT, reserved, multicast, "
+        "unspecified, link-local, and cloud metadata targets are blocked. "
+        "HERMES_ALLOW_PRIVATE_URLS=true or security.allow_private_urls allows ordinary "
+        "private/internal targets; legacy browser.allow_private_urls is honored only "
+        "when security.allow_private_urls is absent. "
+        "Cloud metadata targets and the IPv4 169.254.0.0/16 link-local range remain "
+        "blocked even when private URLs are allowed. "
         "The response is returned inline and never written to local files."
     ),
     "parameters": {

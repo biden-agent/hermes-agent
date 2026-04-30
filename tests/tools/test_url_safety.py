@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from tools.url_safety import (
     is_safe_url,
+    is_always_blocked_url,
     _is_blocked_ip,
     _global_allow_private_urls,
     _reset_allow_private_cache,
@@ -209,6 +210,17 @@ class TestIsBlockedIp:
         assert _is_blocked_ip(ip) is False, f"{ip_str} should be allowed"
 
 
+class TestIsAlwaysBlockedUrl:
+    def test_metadata_hostname_is_always_blocked(self):
+        assert is_always_blocked_url("http://metadata.google.internal/computeMetadata/v1/") is True
+
+    def test_ipv4_link_local_is_always_blocked(self):
+        assert is_always_blocked_url("http://169.254.42.99/anything") is True
+
+    def test_ordinary_private_ip_is_not_always_blocked(self):
+        assert is_always_blocked_url("http://127.0.0.1:8080/api") is False
+
+
 class TestGlobalAllowPrivateUrls:
     """Tests for the security.allow_private_urls config toggle."""
 
@@ -252,8 +264,8 @@ class TestGlobalAllowPrivateUrls:
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
             assert _global_allow_private_urls() is True
 
-    def test_config_browser_fallback(self, monkeypatch):
-        """browser.allow_private_urls works as legacy fallback."""
+    def test_config_browser_fallback_when_security_absent(self, monkeypatch):
+        """browser.allow_private_urls works only as legacy fallback."""
         monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
         cfg = {"browser": {"allow_private_urls": True}}
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
@@ -273,12 +285,19 @@ class TestGlobalAllowPrivateUrls:
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
             assert _global_allow_private_urls() is False
 
-    def test_config_security_takes_precedence_over_browser(self, monkeypatch):
-        """security section is checked before browser section."""
+    def test_config_security_true_takes_precedence_over_browser_false(self, monkeypatch):
+        """security section is checked before the legacy browser section."""
         monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
         cfg = {"security": {"allow_private_urls": True}, "browser": {"allow_private_urls": False}}
         with patch("hermes_cli.config.read_raw_config", return_value=cfg):
             assert _global_allow_private_urls() is True
+
+    def test_config_security_false_takes_precedence_over_browser_true(self, monkeypatch):
+        """Explicit security false disables the legacy browser fallback."""
+        monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+        cfg = {"security": {"allow_private_urls": False}, "browser": {"allow_private_urls": True}}
+        with patch("hermes_cli.config.read_raw_config", return_value=cfg):
+            assert _global_allow_private_urls() is False
 
     def test_env_var_overrides_config(self, monkeypatch):
         """Env var takes priority over config."""

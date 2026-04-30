@@ -75,6 +75,54 @@ def test_curl_tool_allows_private_address_when_config_allows(monkeypatch):
     assert result["body"] == "local ok"
 
 
+def test_curl_tool_honors_legacy_browser_allow_private_urls_config(monkeypatch, request):
+    from hermes_cli import config as hermes_config
+
+    url_safety._reset_allow_private_cache()
+    request.addfinalizer(url_safety._reset_allow_private_cache)
+    monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+    monkeypatch.setattr(
+        hermes_config,
+        "read_raw_config",
+        lambda: {"browser": {"allow_private_urls": True}},
+    )
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _private_dns)
+    monkeypatch.setattr(curl_tool, "check_website_access", lambda _url: None)
+
+    request_obj = httpx.Request("GET", "http://127.0.0.1:8080/ok")
+    response = httpx.Response(200, content=b"legacy ok", request=request_obj)
+    fake_client = _FakeClient([response])
+    monkeypatch.setattr(curl_tool.httpx, "Client", lambda *_args, **_kwargs: fake_client)
+
+    result = json.loads(curl_tool.curl_tool("http://127.0.0.1:8080/ok"))
+
+    assert result["success"] is True
+    assert result["body"] == "legacy ok"
+
+
+def test_curl_tool_security_false_overrides_legacy_browser_true(monkeypatch, request):
+    from hermes_cli import config as hermes_config
+
+    url_safety._reset_allow_private_cache()
+    request.addfinalizer(url_safety._reset_allow_private_cache)
+    monkeypatch.delenv("HERMES_ALLOW_PRIVATE_URLS", raising=False)
+    monkeypatch.setattr(
+        hermes_config,
+        "read_raw_config",
+        lambda: {
+            "security": {"allow_private_urls": False},
+            "browser": {"allow_private_urls": True},
+        },
+    )
+    monkeypatch.setattr(url_safety.socket, "getaddrinfo", _private_dns)
+
+    result = json.loads(curl_tool.curl_tool("http://127.0.0.1:8080/blocked"))
+
+    assert result["success"] is False
+    assert result["blocked"] is True
+    assert "private/internal" in result["error"]
+
+
 def test_curl_tool_returns_public_http_response(monkeypatch):
     monkeypatch.setattr(url_safety.socket, "getaddrinfo", _public_dns)
     monkeypatch.setattr(url_safety, "_global_allow_private_urls", lambda: False)

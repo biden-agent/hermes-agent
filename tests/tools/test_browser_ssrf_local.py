@@ -6,7 +6,9 @@ SSRF checks entirely — the agent already has full local-network access via
 the terminal tool.
 
 Cloud backends (Browserbase, BrowserUse) enforce SSRF by default.  Users
-can opt out for cloud mode via ``browser.allow_private_urls: true``.
+can opt out for ordinary private/internal targets via
+``security.allow_private_urls: true``; legacy ``browser.allow_private_urls``
+is honored only when the security setting is absent.
 """
 
 import json
@@ -56,7 +58,6 @@ class TestPreNavigationSsrf:
     def test_cloud_blocks_private_url_by_default(self, monkeypatch, _common_patches):
         """SSRF protection blocks private URLs in cloud mode."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
 
         result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL))
@@ -64,20 +65,29 @@ class TestPreNavigationSsrf:
         assert result["success"] is False
         assert "private or internal address" in result["error"]
 
-    def test_cloud_allows_private_url_when_setting_true(self, monkeypatch, _common_patches):
-        """Private URLs pass in cloud mode when allow_private_urls is True."""
+    def test_cloud_allows_private_url_when_url_safety_allows(self, monkeypatch, _common_patches):
+        """Private URLs pass in cloud mode when shared URL safety allows them."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: True)
-        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
 
         result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL))
 
         assert result["success"] is True
 
+    def test_cloud_auto_local_blocks_always_blocked_url(self, monkeypatch, _common_patches):
+        """Auto-local routing must not bypass metadata/link-local blocks."""
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(browser_tool, "_auto_local_for_private_urls", lambda: True)
+
+        result = json.loads(browser_tool.browser_navigate("http://169.254.169.254/latest/meta-data/"))
+
+        assert result["success"] is False
+        assert "private or internal address" in result["error"]
+
     def test_cloud_allows_public_url(self, monkeypatch, _common_patches):
         """Public URLs always pass in cloud mode."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
 
         result = json.loads(browser_tool.browser_navigate("https://example.com"))
@@ -89,7 +99,6 @@ class TestPreNavigationSsrf:
     def test_local_allows_private_url(self, monkeypatch, _common_patches):
         """Local backends skip SSRF — private URLs are always allowed."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: False)
 
         result = json.loads(browser_tool.browser_navigate(self.PRIVATE_URL))
@@ -99,7 +108,6 @@ class TestPreNavigationSsrf:
     def test_local_allows_public_url(self, monkeypatch, _common_patches):
         """Local backends pass public URLs too (sanity check)."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
 
         result = json.loads(browser_tool.browser_navigate("https://example.com"))
@@ -166,7 +174,6 @@ class TestPostRedirectSsrf:
     def test_cloud_blocks_redirect_to_private(self, monkeypatch, _common_patches):
         """Redirects to private addresses are blocked in cloud mode."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(
             browser_tool, "_is_safe_url", lambda url: "192.168" not in url,
         )
@@ -181,13 +188,10 @@ class TestPostRedirectSsrf:
         assert result["success"] is False
         assert "redirect landed on a private/internal address" in result["error"]
 
-    def test_cloud_allows_redirect_to_private_when_setting_true(self, monkeypatch, _common_patches):
-        """Redirects to private addresses pass in cloud mode with allow_private_urls."""
+    def test_cloud_allows_redirect_to_private_when_url_safety_allows(self, monkeypatch, _common_patches):
+        """Redirects to private addresses pass when shared URL safety allows them."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: True)
-        monkeypatch.setattr(
-            browser_tool, "_is_safe_url", lambda url: "192.168" not in url,
-        )
+        monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
         monkeypatch.setattr(
             browser_tool,
             "_run_browser_command",
@@ -199,12 +203,27 @@ class TestPostRedirectSsrf:
         assert result["success"] is True
         assert result["url"] == self.PRIVATE_FINAL_URL
 
+    def test_cloud_auto_local_blocks_redirect_to_always_blocked_url(self, monkeypatch, _common_patches):
+        """Auto-local redirects must still enforce metadata/link-local blocks."""
+        monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: "")
+        monkeypatch.setattr(browser_tool, "_get_cloud_provider", lambda: object())
+        monkeypatch.setattr(browser_tool, "_auto_local_for_private_urls", lambda: True)
+        monkeypatch.setattr(
+            browser_tool,
+            "_run_browser_command",
+            lambda *a, **kw: _make_browser_result(url="http://169.254.169.254/latest/meta-data/"),
+        )
+
+        result = json.loads(browser_tool.browser_navigate("http://127.0.0.1/start"))
+
+        assert result["success"] is False
+        assert "redirect landed on a private/internal address" in result["error"]
+
     # -- Local mode: redirect SSRF skipped -------------------------------------
 
     def test_local_allows_redirect_to_private(self, monkeypatch, _common_patches):
         """Redirects to private addresses pass in local mode."""
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(
             browser_tool, "_is_safe_url", lambda url: "192.168" not in url,
         )
@@ -223,7 +242,6 @@ class TestPostRedirectSsrf:
         """Redirects to public addresses always pass (cloud mode)."""
         final = "https://example.com/final"
         monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
-        monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
         monkeypatch.setattr(browser_tool, "_is_safe_url", lambda url: True)
         monkeypatch.setattr(
             browser_tool,
@@ -235,21 +253,3 @@ class TestPostRedirectSsrf:
 
         assert result["success"] is True
         assert result["url"] == final
-
-
-class TestAllowPrivateUrlsConfig:
-    @pytest.fixture(autouse=True)
-    def _reset_cache(self):
-        browser_tool._allow_private_urls_resolved = False
-        browser_tool._cached_allow_private_urls = None
-        yield
-        browser_tool._allow_private_urls_resolved = False
-        browser_tool._cached_allow_private_urls = None
-
-    def test_browser_config_string_false_stays_disabled(self, monkeypatch):
-        monkeypatch.setattr(
-            "hermes_cli.config.read_raw_config",
-            lambda: {"browser": {"allow_private_urls": "false"}},
-        )
-
-        assert browser_tool._allow_private_urls() is False
