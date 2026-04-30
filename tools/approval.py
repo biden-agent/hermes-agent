@@ -389,6 +389,7 @@ def register_gateway_notify(session_key: str, cb) -> None:
     """
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+    logger.debug("gateway approval notify registered session_key=%s", session_key)
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -402,6 +403,11 @@ def unregister_gateway_notify(session_key: str) -> None:
         entries = _gateway_queues.pop(session_key, [])
         for entry in entries:
             entry.event.set()
+    logger.debug(
+        "gateway approval notify unregistered session_key=%s released=%d",
+        session_key,
+        len(entries),
+    )
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -418,6 +424,12 @@ def resolve_gateway_approval(session_key: str, choice: str,
     with _lock:
         queue = _gateway_queues.get(session_key)
         if not queue:
+            logger.info(
+                "gateway approval resolve requested session_key=%s choice=%s resolve_all=%s resolved=0",
+                session_key,
+                choice,
+                resolve_all,
+            )
             return 0
         if resolve_all:
             targets = list(queue)
@@ -430,6 +442,13 @@ def resolve_gateway_approval(session_key: str, choice: str,
     for entry in targets:
         entry.result = choice
         entry.event.set()
+    logger.info(
+        "gateway approval resolve requested session_key=%s choice=%s resolve_all=%s resolved=%d",
+        session_key,
+        choice,
+        resolve_all,
+        len(targets),
+    )
     return len(targets)
 
 
@@ -1047,6 +1066,18 @@ def check_all_command_guards(command: str, env_type: str,
             entry = _ApprovalEntry(approval_data)
             with _lock:
                 _gateway_queues.setdefault(session_key, []).append(entry)
+                queue_depth = len(_gateway_queues.get(session_key, []))
+            logger.info(
+                "gateway approval requested session_key=%s pattern_key=%s pattern_keys=%s "
+                "description=%s command=%r command_len=%d queue_depth=%d",
+                session_key,
+                primary_key,
+                ",".join(all_keys),
+                combined_desc,
+                command,
+                len(command or ""),
+                queue_depth,
+            )
 
             # Notify plugins that an approval is being requested. Fires before
             # the gateway notify callback so observers (e.g. macOS notifier
@@ -1064,8 +1095,21 @@ def check_all_command_guards(command: str, env_type: str,
             # Notify the user (bridges sync agent thread → async gateway)
             try:
                 notify_cb(approval_data)
+                logger.info(
+                    "gateway approval notify sent session_key=%s command=%r command_len=%d description=%s",
+                    session_key,
+                    command,
+                    len(command or ""),
+                    combined_desc,
+                )
             except Exception as exc:
-                logger.warning("Gateway approval notify failed: %s", exc)
+                logger.warning(
+                    "gateway approval notify failed session_key=%s command=%r command_len=%d error=%s",
+                    session_key,
+                    command,
+                    len(command or ""),
+                    exc,
+                )
                 with _lock:
                     queue = _gateway_queues.get(session_key, [])
                     if entry in queue:
@@ -1102,6 +1146,14 @@ def check_all_command_guards(command: str, env_type: str,
             _deadline = _now + max(timeout, 0)
             _activity_state = {"last_touch": _now, "start": _now}
             resolved = False
+            logger.info(
+                "gateway approval waiting session_key=%s timeout=%s command=%r command_len=%d description=%s",
+                session_key,
+                timeout,
+                command,
+                len(command or ""),
+                combined_desc,
+            )
             while True:
                 _remaining = _deadline - time.monotonic()
                 if _remaining <= 0:
@@ -1132,6 +1184,18 @@ def check_all_command_guards(command: str, env_type: str,
             _outcome = (
                 "timeout" if not resolved
                 else (choice if choice else "timeout")
+            )
+            elapsed = time.monotonic() - _now
+            log_fn = logger.warning if _outcome == "timeout" else logger.info
+            log_fn(
+                "gateway approval resolved session_key=%s outcome=%s elapsed=%.2fs "
+                "command=%r command_len=%d description=%s",
+                session_key,
+                _outcome,
+                elapsed,
+                command,
+                len(command or ""),
+                combined_desc,
             )
             _fire_approval_hook(
                 "post_approval_response",

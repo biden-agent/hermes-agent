@@ -143,6 +143,39 @@ class TestApproveAndCheckSession:
         assert is_approved(key, "rm") is True
 
 
+class TestGatewayApprovalObservability:
+    def test_blocking_gateway_approval_logs_request_wait_and_resolution(self, caplog, monkeypatch):
+        session_key = "gateway-observability-session"
+        _clear_session(session_key)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")
+        monkeypatch.setenv("HERMES_EXEC_ASK", "1")
+
+        def notify(_approval_data):
+            approval_module.resolve_gateway_approval(session_key, "once")
+
+        caplog.set_level("INFO", logger=approval_module.logger.name)
+        approval_module.register_gateway_notify(session_key, notify)
+        token = approval_module.set_current_session_key(session_key)
+        try:
+            result = approval_module.check_all_command_guards(
+                "rm -rf /tmp/hermes-observability-test",
+                "local",
+            )
+        finally:
+            approval_module.reset_current_session_key(token)
+            approval_module.unregister_gateway_notify(session_key)
+            _clear_session(session_key)
+
+        assert result["approved"] is True
+        log_text = caplog.text
+        assert "gateway approval requested" in log_text
+        assert "gateway approval notify sent" in log_text
+        assert "gateway approval waiting" in log_text
+        assert "gateway approval resolved" in log_text
+        assert "session_key=gateway-observability-session" in log_text
+        assert "command='rm -rf /tmp/hermes-observability-test'" in log_text
+
+
 class TestSessionKeyContext:
     def test_context_session_key_overrides_process_env(self):
         token = approval_module.set_current_session_key("alice")

@@ -1894,9 +1894,20 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
+        approval_id: Any = "unknown"
         try:
             approval_id = next(self._approval_counter)
             cmd_preview = command[:3000] + "..." if len(command) > 3000 else command
+            logger.info(
+                "[Feishu] send_exec_approval attempt approval_id=%s chat_id=%s session_key=%s "
+                "description=%s command=%r command_len=%d",
+                approval_id,
+                chat_id,
+                session_key,
+                description,
+                command,
+                len(command or ""),
+            )
 
             def _btn(label: str, action_name: str, btn_type: str = "default") -> dict:
                 return {
@@ -1947,9 +1958,42 @@ class FeishuAdapter(BasePlatformAdapter):
                 }
                 state.update(self._approval_requester_state(metadata))
                 self._approval_state[approval_id] = state
+                logger.info(
+                    "[Feishu] send_exec_approval sent approval_id=%s chat_id=%s message_id=%s "
+                    "session_key=%s description=%s command=%r command_len=%d",
+                    approval_id,
+                    chat_id,
+                    result.message_id or "",
+                    session_key,
+                    description,
+                    command,
+                    len(command or ""),
+                )
+            else:
+                logger.warning(
+                    "[Feishu] send_exec_approval failed approval_id=%s chat_id=%s session_key=%s "
+                    "description=%s command=%r command_len=%d error=%s",
+                    approval_id,
+                    chat_id,
+                    session_key,
+                    description,
+                    command,
+                    len(command or ""),
+                    result.error,
+                )
             return result
         except Exception as exc:
-            logger.warning("[Feishu] send_exec_approval failed: %s", exc)
+            logger.warning(
+                "[Feishu] send_exec_approval failed approval_id=%s chat_id=%s session_key=%s "
+                "description=%s command=%r command_len=%d error=%s",
+                approval_id,
+                chat_id,
+                session_key,
+                description,
+                command,
+                len(command or ""),
+                exc,
+            )
             return SendResult(success=False, error=str(exc))
 
     @staticmethod

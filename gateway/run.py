@@ -3981,6 +3981,15 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        logger.info(
+            "gateway inbound received platform=%s chat_id=%s user_id=%s message=%r message_len=%d internal=%s",
+            source.platform.value if source.platform else "unknown",
+            source.chat_id or "",
+            source.user_id or "",
+            getattr(event, "text", ""),
+            len(getattr(event, "text", "") or ""),
+            bool(getattr(event, "internal", False)),
+        )
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -11414,6 +11423,16 @@ class GatewayRunner:
 
                 cmd = approval_data.get("command", "")
                 desc = approval_data.get("description", "dangerous command")
+                logger.info(
+                    "gateway approval card send attempted platform=%s chat_id=%s session_key=%s "
+                    "description=%s command=%r command_len=%d",
+                    source.platform.value if source.platform else "unknown",
+                    _status_chat_id,
+                    _approval_session_key,
+                    desc,
+                    cmd,
+                    len(cmd or ""),
+                )
 
                 # Prefer button-based approval when the adapter supports it.
                 # Check the *class* for the method, not the instance — avoids
@@ -11439,6 +11458,17 @@ class GatewayRunner:
                             _loop_for_step,
                         ).result(timeout=15)
                         if _approval_result.success:
+                            logger.info(
+                                "gateway approval card sent platform=%s chat_id=%s session_key=%s "
+                                "message_id=%s description=%s command=%r command_len=%d",
+                                source.platform.value if source.platform else "unknown",
+                                _status_chat_id,
+                                _approval_session_key,
+                                getattr(_approval_result, "message_id", "") or "",
+                                desc,
+                                cmd,
+                                len(cmd or ""),
+                            )
                             return
                         logger.warning(
                             "Button-based approval failed (send returned error), falling back to text: %s",
@@ -11467,8 +11497,23 @@ class GatewayRunner:
                         ),
                         _loop_for_step,
                     ).result(timeout=15)
+                    logger.info(
+                        "gateway approval text sent platform=%s chat_id=%s session_key=%s description=%s command=%r command_len=%d",
+                        source.platform.value if source.platform else "unknown",
+                        _status_chat_id,
+                        _approval_session_key,
+                        desc,
+                        cmd,
+                        len(cmd or ""),
+                    )
                 except Exception as _e:
-                    logger.error("Failed to send approval request: %s", _e)
+                    logger.error(
+                        "Failed to send approval request session_key=%s command=%r command_len=%d error=%s",
+                        _approval_session_key,
+                        cmd,
+                        len(cmd or ""),
+                        _e,
+                    )
 
             # Prepend pending model switch note so the model knows about the switch
             _pending_notes = getattr(self, '_pending_model_notes', {})
@@ -11584,7 +11629,32 @@ class GatewayRunner:
                 else:
                     _run_message = message
 
+                _agent_run_start = time.time()
+                logger.info(
+                    "gateway agent run start platform=%s chat_id=%s session_key=%s session_id=%s "
+                    "message=%r message_len=%d history=%d",
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "",
+                    session_key or "",
+                    getattr(agent, "session_id", session_id),
+                    message,
+                    len(message or ""),
+                    len(agent_history),
+                )
                 result = agent.run_conversation(_run_message, conversation_history=agent_history, task_id=session_id)
+                logger.info(
+                    "gateway agent run end platform=%s chat_id=%s session_key=%s session_id=%s "
+                    "duration=%.2fs api_calls=%s failed=%s interrupted=%s response_chars=%d",
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "",
+                    session_key or "",
+                    getattr(agent, "session_id", session_id),
+                    time.time() - _agent_run_start,
+                    result.get("api_calls", 0) if isinstance(result, dict) else "",
+                    result.get("failed", False) if isinstance(result, dict) else "",
+                    bool(result.get("interrupted")) if isinstance(result, dict) else "",
+                    len((result.get("final_response") or "") if isinstance(result, dict) else ""),
+                )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 reset_current_session_key(_approval_session_token)
@@ -11609,9 +11679,19 @@ class GatewayRunner:
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
 
             if not final_response:
                 error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                logger.info(
+                    "gateway response ready platform=%s chat_id=%s session_key=%s session_id=%s response_chars=%d failed=%s",
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "",
+                    session_key or "",
+                    effective_session_id,
+                    len(error_msg or ""),
+                    result.get("failed", False),
+                )
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
@@ -11681,7 +11761,15 @@ class GatewayRunner:
                     entry.session_id = agent.session_id
                     self.session_store._save()
 
-            effective_session_id = getattr(agent, 'session_id', session_id) if agent else session_id
+            logger.info(
+                "gateway response ready platform=%s chat_id=%s session_key=%s session_id=%s response_chars=%d failed=%s",
+                source.platform.value if source.platform else "unknown",
+                source.chat_id or "",
+                session_key or "",
+                effective_session_id,
+                len(final_response or ""),
+                result.get("failed", False),
+            )
 
             # When compression created a new session, the messages list was
             # shortened.  Using the original history offset would produce an

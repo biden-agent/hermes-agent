@@ -1590,6 +1590,60 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_tool_call_observability_logs_start_and_end(self, agent, caplog):
+        tc = _mock_tool_call(
+            name="terminal",
+            arguments='{"command":"bash -lc \\\"deploy --token SECRET_TOKEN_SHOULD_NOT_APPEAR\\\""}',
+            call_id="c-observe",
+        )
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
+        messages = []
+        agent.valid_tool_names.add("terminal")
+
+        caplog.set_level(logging.INFO, logger=run_agent.logger.name)
+        result_payload = json.dumps({
+            "status": "approval_required",
+            "approval_required": True,
+            "exit_code": 0,
+        })
+        with patch("run_agent.handle_function_call", return_value=result_payload):
+            agent._execute_tool_calls(mock_msg, messages, "task-1")
+
+        log_text = caplog.text
+        assert "tool call start" in log_text
+        assert "tool call end" in log_text
+        assert "tool=terminal" in log_text
+        assert "tool_call_id=c-observe" in log_text
+        assert "args=" in log_text
+        assert "args_len=" in log_text
+        assert "command=" in log_text
+        assert "status=approval_required" in log_text
+        assert "exit_code=0" in log_text
+        assert "approval_required=True" in log_text
+        assert "SECRET_TOKEN_SHOULD_NOT_APPEAR" in log_text
+
+    def test_api_call_heartbeat_logs_periodic_wait(self, caplog):
+        caplog.set_level(logging.INFO, logger=run_agent.logger.name)
+
+        with run_agent._ApiCallHeartbeat(
+            session_id="session-heartbeat",
+            task_id="task-heartbeat",
+            call=2,
+            model="model-x",
+            provider="provider-y",
+            api_mode="chat_completions",
+            interval=0.01,
+        ):
+            run_agent.threading.Event().wait(0.035)
+
+        log_text = caplog.text
+        assert "model api call heartbeat" in log_text
+        assert "session=session-heartbeat" in log_text
+        assert "task_id=task-heartbeat" in log_text
+        assert "call=2" in log_text
+        assert "model=model-x" in log_text
+        assert "provider=provider-y" in log_text
+
     def test_interrupt_skips_remaining(self, agent):
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
@@ -3148,6 +3202,31 @@ class TestRetryExhaustion:
         assert result.get("failed") is True
         assert "error" in result
         assert "rate limited" in result["error"]
+
+    def test_api_error_logs_structured_observability_failure(self, agent, caplog):
+        self._setup_agent(agent)
+        agent.client.chat.completions.create.side_effect = RuntimeError("rate limited")
+        caplog.set_level(logging.WARNING, logger=run_agent.logger.name)
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("run_agent.time", self._make_fast_time_mock()),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result.get("failed") is True
+        log_text = caplog.text
+        assert "model api call failed" in log_text
+        assert "session=" in log_text
+        assert "task_id=" in log_text
+        assert "call=0" in log_text
+        assert "duration=" in log_text
+        assert "model=" in log_text
+        assert "provider=" in log_text
+        assert "api_mode=" in log_text
+        assert "error_type=RuntimeError" in log_text
+        assert "summary=rate limited" in log_text
 
     def test_build_api_kwargs_error_no_unbound_local(self, agent):
         """When _build_api_kwargs raises, except handler must not crash with UnboundLocalError.

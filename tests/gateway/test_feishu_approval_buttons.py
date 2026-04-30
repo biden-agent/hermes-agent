@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import logging
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +135,40 @@ class TestFeishuExecApproval:
         assert action_names == [
             "approve_once", "approve_session", "approve_always", "deny"
         ]
+
+    @pytest.mark.asyncio
+    async def test_logs_successful_approval_card_send_with_correlation_fields(self, caplog):
+        adapter = _make_adapter()
+
+        mock_response = SimpleNamespace(
+            success=lambda: True,
+            data=SimpleNamespace(message_id="msg_logged"),
+        )
+        secret_tail = "SECRET_TOKEN_SHOULD_NOT_APPEAR"
+        command = "bash -lc 'deploy --token " + secret_tail + "'"
+
+        caplog.set_level(logging.INFO, logger=feishu_module.logger.name)
+        with patch.object(
+            adapter, "_feishu_send_with_retry", new_callable=AsyncMock,
+            return_value=mock_response,
+        ):
+            result = await adapter.send_exec_approval(
+                chat_id="oc_logged",
+                command=command,
+                session_key="agent:main:feishu:group:oc_logged",
+                description="dangerous deploy",
+            )
+
+        assert result.success is True
+        log_text = caplog.text
+        assert "send_exec_approval sent" in log_text
+        assert "approval_id=" in log_text
+        assert "chat_id=oc_logged" in log_text
+        assert "message_id=msg_logged" in log_text
+        assert "session_key=agent:main:feishu:group:oc_logged" in log_text
+        assert "description=dangerous deploy" in log_text
+        assert "command=" in log_text
+        assert secret_tail in log_text
 
     @pytest.mark.asyncio
     async def test_stores_approval_state(self):

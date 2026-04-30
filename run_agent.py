@@ -317,6 +317,118 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "web_search",
 })
 
+
+def _stable_json_text(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value or "")
+
+
+class _ApiCallHeartbeat:
+    """Emit periodic logs while a blocking model request is in flight."""
+
+    def __init__(
+        self,
+        *,
+        session_id: str,
+        task_id: str,
+        call: int,
+        model: str,
+        provider: str,
+        api_mode: str,
+        interval: Optional[float] = None,
+    ) -> None:
+        self.session_id = session_id or "none"
+        self.task_id = task_id or ""
+        self.call = call
+        self.model = model
+        self.provider = provider or "unknown"
+        self.api_mode = api_mode or "unknown"
+        self.interval = interval if interval is not None else _get_api_heartbeat_interval()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._started_at = time.monotonic()
+
+    def __enter__(self):
+        if self.interval <= 0:
+            return self
+        self._started_at = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"api-heartbeat-{self.session_id}-{self.call}",
+            daemon=True,
+        )
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
+        return False
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            logger.info(
+                "model api call heartbeat session=%s task_id=%s call=%d elapsed=%.2fs model=%s provider=%s api_mode=%s",
+                self.session_id,
+                self.task_id,
+                self.call,
+                time.monotonic() - self._started_at,
+                self.model,
+                self.provider,
+                self.api_mode,
+            )
+
+
+def _get_api_heartbeat_interval() -> float:
+    raw = os.getenv("HERMES_API_HEARTBEAT_INTERVAL_SECONDS", "60")
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 60.0
+
+
+def _tool_call_observability_fields(function_name: str, function_args: Dict[str, Any], function_result: Any = None) -> Dict[str, Any]:
+    args_text = _stable_json_text(function_args)
+    fields: Dict[str, Any] = {
+        "args_keys": ",".join(sorted(str(k) for k in function_args.keys())),
+        "args": args_text,
+        "args_len": len(args_text),
+    }
+    if function_name == "terminal":
+        command = function_args.get("command", "")
+        fields["command"] = command
+        fields["command_len"] = len(command or "")
+
+    if function_result is not None:
+        parsed = None
+        if isinstance(function_result, str):
+            try:
+                parsed = json.loads(function_result)
+            except Exception:
+                parsed = None
+        elif isinstance(function_result, dict):
+            parsed = function_result
+        if isinstance(parsed, dict):
+            for key in (
+                "status", "exit_code", "approval_required",
+                "user_approved", "smart_approved", "smart_denied",
+            ):
+                if key in parsed:
+                    fields[key] = parsed.get(key)
+    return fields
+
+
+def _format_observability_fields(fields: Dict[str, Any]) -> str:
+    raw_text_keys = {"args", "command"}
+    return " ".join(
+        f"{key}={value!r}" if key in raw_text_keys and isinstance(value, str)
+        else f"{key}={value}"
+        for key, value in fields.items()
+    )
+
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 
@@ -9246,6 +9358,16 @@ class AIAgent:
                     print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
         for tc, name, args in parsed_calls:
+            logger.info(
+                "tool call start session=%s task_id=%s tool=%s tool_call_id=%s %s",
+                self.session_id or "none",
+                effective_task_id or "",
+                name,
+                getattr(tc, "id", ""),
+                _format_observability_fields(
+                    _tool_call_observability_fields(name, args)
+                ),
+            )
             if self.tool_progress_callback:
                 try:
                     preview = _build_tool_preview(name, args)
@@ -9324,9 +9446,31 @@ class AIAgent:
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             if is_error:
-                logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
+                logger.warning(
+                    "tool call end session=%s task_id=%s tool=%s tool_call_id=%s duration=%.2fs status=error %s result_chars=%d",
+                    self.session_id or "none",
+                    effective_task_id or "",
+                    function_name,
+                    getattr(tool_call, "id", ""),
+                    duration,
+                    _format_observability_fields(
+                        _tool_call_observability_fields(function_name, function_args, result)
+                    ),
+                    len(result),
+                )
             else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
+                logger.info(
+                    "tool call end session=%s task_id=%s tool=%s tool_call_id=%s duration=%.2fs status=success %s result_chars=%d",
+                    self.session_id or "none",
+                    effective_task_id or "",
+                    function_name,
+                    getattr(tool_call, "id", ""),
+                    duration,
+                    _format_observability_fields(
+                        _tool_call_observability_fields(function_name, function_args, result)
+                    ),
+                    len(result),
+                )
             results[index] = (function_name, function_args, result, duration, is_error)
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
@@ -9427,8 +9571,11 @@ class AIAgent:
                 function_name, function_args, function_result, tool_duration, is_error = r
 
                 if is_error:
-                    result_preview = function_result[:200] if len(function_result) > 200 else function_result
-                    logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                    logger.debug(
+                        "tool %s returned error result omitted from observability log (%d chars)",
+                        function_name,
+                        len(function_result),
+                    )
 
                 if self.tool_progress_callback:
                     try:
@@ -9612,6 +9759,16 @@ class AIAgent:
                     pass  # never block tool execution
 
             tool_start_time = time.time()
+            logger.info(
+                "tool call start session=%s task_id=%s tool=%s tool_call_id=%s %s",
+                self.session_id or "none",
+                effective_task_id or "",
+                function_name,
+                getattr(tool_call, "id", ""),
+                _format_observability_fields(
+                    _tool_call_observability_fields(function_name, function_args)
+                ),
+            )
 
             if _block_msg is not None:
                 # Tool blocked by plugin policy — return error without executing.
@@ -9804,9 +9961,31 @@ class AIAgent:
             # in the UI always have a corresponding detailed entry on disk.
             _is_error_result, _ = _detect_tool_failure(function_name, function_result)
             if _is_error_result:
-                logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+                logger.warning(
+                    "tool call end session=%s task_id=%s tool=%s tool_call_id=%s duration=%.2fs status=error %s result_chars=%d",
+                    self.session_id or "none",
+                    effective_task_id or "",
+                    function_name,
+                    getattr(tool_call, "id", ""),
+                    tool_duration,
+                    _format_observability_fields(
+                        _tool_call_observability_fields(function_name, function_args, function_result)
+                    ),
+                    len(function_result),
+                )
             else:
-                logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, len(function_result))
+                logger.info(
+                    "tool call end session=%s task_id=%s tool=%s tool_call_id=%s duration=%.2fs status=success %s result_chars=%d",
+                    self.session_id or "none",
+                    effective_task_id or "",
+                    function_name,
+                    getattr(tool_call, "id", ""),
+                    tool_duration,
+                    _format_observability_fields(
+                        _tool_call_observability_fields(function_name, function_args, function_result)
+                    ),
+                    len(function_result),
+                )
 
             if self.tool_progress_callback:
                 try:
@@ -10758,6 +10937,7 @@ class AIAgent:
             api_kwargs = None  # Guard against UnboundLocalError in except handler
 
             while retry_count < max_retries:
+                api_attempt_start = time.time()
                 # ── Nous Portal rate limit guard ──────────────────────
                 # If another session already recorded that Nous is rate-
                 # limited, skip the API call entirely.  Each attempt
@@ -10837,6 +11017,20 @@ class AIAgent:
                     if env_var_enabled("HERMES_DUMP_REQUESTS"):
                         self._dump_api_request_debug(api_kwargs, reason="preflight")
 
+                    logger.info(
+                        "model api call start session=%s task_id=%s call=%d model=%s provider=%s "
+                        "api_mode=%s messages=%d tools=%d approx_input_tokens=%s",
+                        self.session_id or "none",
+                        effective_task_id,
+                        api_call_count,
+                        api_kwargs.get("model", self.model),
+                        self.provider or "unknown",
+                        self.api_mode,
+                        len(api_messages),
+                        len(self.tools or []),
+                        approx_tokens,
+                    )
+
                     # Always prefer the streaming path — even without stream
                     # consumers.  Streaming gives us fine-grained health
                     # checking (90s stale-stream detection, 60s read timeout)
@@ -10880,14 +11074,32 @@ class AIAgent:
                         if isinstance(getattr(self, "client", None), Mock):
                             _use_streaming = False
 
-                    if _use_streaming:
-                        response = self._interruptible_streaming_api_call(
-                            api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    else:
-                        response = self._interruptible_api_call(api_kwargs)
+                    with _ApiCallHeartbeat(
+                        session_id=self.session_id or "none",
+                        task_id=effective_task_id,
+                        call=api_call_count,
+                        model=api_kwargs.get("model", self.model),
+                        provider=self.provider or "unknown",
+                        api_mode=self.api_mode,
+                    ):
+                        if _use_streaming:
+                            response = self._interruptible_streaming_api_call(
+                                api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        else:
+                            response = self._interruptible_api_call(api_kwargs)
                     
-                    api_duration = time.time() - api_start_time
+                    api_duration = time.time() - api_attempt_start
+                    logger.info(
+                        "model api call end session=%s task_id=%s call=%d duration=%.2fs model=%s provider=%s response_model=%s",
+                        self.session_id or "none",
+                        effective_task_id,
+                        api_call_count,
+                        api_duration,
+                        api_kwargs.get("model", self.model),
+                        self.provider or "unknown",
+                        getattr(response, "model", "unknown") if response else "none",
+                    )
                     
                     # Stop thinking spinner silently -- the response box or tool
                     # execution messages that follow are more informative.
@@ -11472,7 +11684,17 @@ class AIAgent:
                         thinking_spinner = None
                     if self.thinking_callback:
                         self.thinking_callback("")
-                    api_elapsed = time.time() - api_start_time
+                    api_elapsed = time.time() - api_attempt_start
+                    logger.warning(
+                        "model api call interrupted session=%s task_id=%s call=%d duration=%.2fs model=%s provider=%s api_mode=%s",
+                        self.session_id or "none",
+                        effective_task_id,
+                        api_call_count,
+                        api_elapsed,
+                        (api_kwargs or {}).get("model", self.model) if isinstance(api_kwargs, dict) else self.model,
+                        self.provider or "unknown",
+                        self.api_mode,
+                    )
                     self._vprint(f"{self.log_prefix}⚡ Interrupted during API call.", force=True)
                     self._persist_session(messages, conversation_history)
                     interrupted = True
@@ -11810,7 +12032,7 @@ class AIAgent:
                         continue
 
                     retry_count += 1
-                    elapsed_time = time.time() - api_start_time
+                    elapsed_time = time.time() - api_attempt_start
                     self._touch_activity(
                         f"API error recovery (attempt {retry_count}/{max_retries})"
                     )
@@ -11818,6 +12040,19 @@ class AIAgent:
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
                     _error_summary = self._summarize_api_error(api_error)
+                    logger.warning(
+                        "model api call failed session=%s task_id=%s call=%d duration=%.2fs model=%s provider=%s api_mode=%s error_type=%s status_code=%s summary=%s",
+                        self.session_id or "none",
+                        effective_task_id,
+                        api_call_count,
+                        elapsed_time,
+                        (api_kwargs or {}).get("model", self.model) if isinstance(api_kwargs, dict) else self.model,
+                        self.provider or "unknown",
+                        self.api_mode,
+                        error_type,
+                        status_code,
+                        _error_summary,
+                    )
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s summary=%s",
                         retry_count,
@@ -12846,6 +13081,15 @@ class AIAgent:
                     )
 
                     assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
+                    logger.info(
+                        "model response ready session=%s task_id=%s call=%d finish_reason=%s tool_calls=%d content_chars=%d",
+                        self.session_id or "none",
+                        effective_task_id,
+                        api_call_count,
+                        finish_reason,
+                        len(getattr(assistant_message, "tool_calls", None) or []),
+                        len(assistant_message.content or ""),
+                    )
                     
                     # If this turn has both content AND tool_calls, capture the content
                     # as a fallback final response. Common pattern: model delivers its
@@ -12984,6 +13228,14 @@ class AIAgent:
                 else:
                     # No tool calls - this is the final response
                     final_response = assistant_message.content or ""
+                    logger.info(
+                        "response ready session=%s task_id=%s call=%d finish_reason=%s content_chars=%d",
+                        self.session_id or "none",
+                        effective_task_id,
+                        api_call_count,
+                        finish_reason,
+                        len(final_response),
+                    )
                     
                     # Fix: unmute output when entering the no-tool-call branch
                     # so the user can see empty-response warnings and recovery
