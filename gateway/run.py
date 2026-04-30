@@ -5607,10 +5607,11 @@ class GatewayRunner:
             # restarts where the session was active (never completed).
             #
             # Also clear the resume_pending flag (set by drain-timeout
-            # shutdown) — the turn ran to completion, so recovery
-            # succeeded and subsequent messages should no longer receive
-            # the restart-interruption system note.
-            if session_key:
+            # shutdown) only after a real successful completion. Interrupted
+            # or failed turns must preserve it so restart recovery still gets
+            # a chance on the next user message.
+            _turn_completed_successfully = not agent_result.get("interrupted") and not agent_result.get("failed")
+            if session_key and _turn_completed_successfully:
                 self._clear_restart_failure_count(session_key)
                 try:
                     self.session_store.clear_resume_pending(session_key)
@@ -5619,6 +5620,13 @@ class GatewayRunner:
                         "clear_resume_pending failed for %s: %s",
                         session_key, _e,
                     )
+            elif session_key:
+                logger.debug(
+                    "Preserving restart-resume state for incomplete turn: session=%s interrupted=%s failed=%s",
+                    session_key,
+                    bool(agent_result.get("interrupted")),
+                    bool(agent_result.get("failed")),
+                )
 
             # Surface error details when the agent failed silently (final_response=None)
             if not response and agent_result.get("failed"):
@@ -11573,6 +11581,8 @@ class GatewayRunner:
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
                     "failed": result.get("failed", False),
+                    "interrupted": bool(result.get("interrupted")),
+                    "interrupt_message": result.get("interrupt_message"),
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
@@ -11679,6 +11689,9 @@ class GatewayRunner:
                 "last_reasoning": result.get("last_reasoning"),
                 "messages": result_holder[0].get("messages", []) if result_holder[0] else [],
                 "api_calls": result_holder[0].get("api_calls", 0) if result_holder[0] else 0,
+                "failed": result.get("failed", False),
+                "interrupted": bool(result.get("interrupted")),
+                "interrupt_message": result.get("interrupt_message"),
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "last_prompt_tokens": _last_prompt_toks,

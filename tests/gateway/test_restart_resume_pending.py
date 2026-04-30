@@ -32,13 +32,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, Platform
 from gateway.run import (
     _auto_continue_freshness_window,
     _coerce_gateway_timestamp,
     _is_fresh_gateway_interruption,
     _last_transcript_timestamp,
 )
+from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, SessionStore
 from tests.gateway.restart_test_helpers import (
     make_restart_runner,
@@ -905,6 +906,56 @@ async def test_drain_timeout_skips_pending_sentinel_sessions():
     calls = session_store.mark_resume_pending.call_args_list
     marked = {args[0][0] for args in calls}
     assert marked == {session_key_real}
+
+
+@pytest.mark.asyncio
+async def test_control_interrupt_does_not_clear_resume_pending(monkeypatch, tmp_path):
+    """A gateway restart interrupt is not a successful resumed turn.
+
+    Regression for the production failure where ``_run_agent()`` returned a
+    control interrupt but the outer handler treated it like a completed turn
+    and cleared ``resume_pending``, causing startup crash-recovery to suspend
+    the old session and route the next user message into a fresh session.
+    """
+    runner, _adapter = make_restart_runner()
+    source = make_restart_source(chat_id="resume-chat")
+    event = MessageEvent(text="继续啊", source=source, message_id="m1")
+
+    store = _make_store(tmp_path)
+    entry = store.get_or_create_session(source)
+    store.mark_resume_pending(entry.session_key, reason="restart_timeout")
+    original_clear = store.clear_resume_pending
+    store.clear_resume_pending = MagicMock(wraps=original_clear)
+    runner.session_store = store
+
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    runner._collect_event_sender_ids = MagicMock(return_value=set())
+    runner._resolve_effective_enabled_toolsets = MagicMock(return_value=[])
+    runner._set_session_env = MagicMock(return_value=object())
+    runner._clear_session_env = MagicMock()
+    runner._prepare_inbound_message_text = AsyncMock(return_value=event.text)
+    runner._bind_adapter_run_generation = MagicMock()
+    runner._is_session_run_current = MagicMock(return_value=True)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Operation interrupted: Gateway restarting",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": True,
+            "interrupt_message": "Gateway restarting",
+        }
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        source,
+        entry.session_key,
+        run_generation=1,
+    )
+
+    assert response is None
+    store.clear_resume_pending.assert_not_called()
+    assert store._entries[entry.session_key].resume_pending is True
 
 
 # ---------------------------------------------------------------------------

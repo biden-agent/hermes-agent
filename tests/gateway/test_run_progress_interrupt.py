@@ -8,7 +8,6 @@ of tool-progress bubbles for calls that were already parsed from the LLM
 response — making the interrupt feel ignored.
 """
 
-import asyncio
 import importlib
 import sys
 import time
@@ -105,6 +104,27 @@ class InterruptedAgent:
         self.tool_progress_callback("tool.started", "web_search", "platform.moonshot.cn", {})
         time.sleep(0.35)  # let the drain loop attempt to process the queue
         return {"final_response": "interrupted", "messages": [], "api_calls": 1}
+
+
+class ControlInterruptAgent:
+    """Simulates a gateway restart/shutdown control interrupt result."""
+
+    def __init__(self, **kwargs):
+        self.tools = []
+        self._interrupt_requested = True
+
+    @property
+    def is_interrupted(self) -> bool:
+        return self._interrupt_requested
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        return {
+            "final_response": "Operation interrupted: Gateway restarting",
+            "messages": [],
+            "api_calls": 1,
+            "interrupted": True,
+            "interrupt_message": "Gateway restarting",
+        }
 
 
 def _make_runner(adapter):
@@ -213,3 +233,19 @@ async def test_progress_suppressed_when_agent_is_interrupted(monkeypatch, tmp_pa
             f"event '{leaked_query}' leaked into the UI after interrupt — "
             f"progress_callback / drain loop is not checking is_interrupted"
         )
+
+
+@pytest.mark.asyncio
+async def test_run_agent_preserves_control_interrupt_metadata(monkeypatch, tmp_path):
+    """Gateway restart interrupts must remain visible to the caller.
+
+    The outer message handler suppresses control-interrupt responses and keeps
+    resume_pending intact based on these fields. Dropping them makes a forced
+    restart look like a normal successful turn.
+    """
+    _adapter, result = await _run_once(
+        monkeypatch, tmp_path, ControlInterruptAgent, "sess-control-interrupt"
+    )
+
+    assert result["interrupted"] is True
+    assert result["interrupt_message"] == "Gateway restarting"
