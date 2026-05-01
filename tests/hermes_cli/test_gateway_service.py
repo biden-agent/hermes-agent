@@ -71,6 +71,7 @@ class TestSystemdServiceRefresh:
             calls.append(cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **kwargs: None)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.systemd_start()
@@ -94,6 +95,7 @@ class TestSystemdServiceRefresh:
             calls.append(cmd)
             return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **kwargs: None)
         monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
 
         gateway_cli.systemd_restart()
@@ -495,6 +497,7 @@ class TestGatewaySystemServiceRouting:
             "_request_gateway_self_restart",
             lambda pid: calls.append(("self", pid)) or True,
         )
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **kwargs: None)
 
         # Simulate: old process dies immediately, new process becomes active
         kill_call_count = [0]
@@ -540,6 +543,7 @@ class TestGatewaySystemServiceRouting:
     def test_systemd_restart_recovers_failed_planned_restart(self, monkeypatch, capsys):
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **kwargs: None)
         monkeypatch.setattr(
             "gateway.status.read_runtime_status",
             lambda: {"restart_requested": True, "gateway_state": "stopped"},
