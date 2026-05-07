@@ -1480,6 +1480,68 @@ class TestAdapterBehavior(unittest.TestCase):
         )
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_group_message_with_only_bot_mention_reaches_agent_with_default_prompt(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._bot_open_id = "ou_bot"
+        adapter.handle_message = AsyncMock()
+        adapter._is_duplicate = Mock(return_value=False)
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Platform Team", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "u_dana", "user_name": "Dana", "user_id_alt": "on_dana"}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="parent question")
+
+        message = SimpleNamespace(
+            message_id="om_mention_only",
+            chat_type="group",
+            chat_id="oc_group",
+            thread_id="omt_thread",
+            root_id="om_root",
+            parent_id="om_parent",
+            upper_message_id=None,
+            message_type="text",
+            content=json.dumps({"text": "@_user_1"}),
+            mentions=[
+                SimpleNamespace(
+                    key="@_user_1",
+                    name="Hermes",
+                    id=SimpleNamespace(open_id="ou_bot", user_id="u_bot"),
+                )
+            ],
+        )
+        sender_id = SimpleNamespace(open_id="ou_dana", user_id="u_dana", union_id="on_dana")
+        data = SimpleNamespace(
+            event=SimpleNamespace(message=message, sender=SimpleNamespace(sender_id=sender_id))
+        )
+
+        async def _sleep(_delay):
+            return None
+
+        async def _run() -> None:
+            with patch("gateway.platforms.feishu.asyncio.sleep", side_effect=_sleep):
+                await adapter._handle_message_event_data(data)
+                pending = list(adapter._pending_text_batch_tasks.values())
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run(_run())
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        self.assertEqual(event.text, "How can I help?")
+        self.assertEqual(event.source.chat_id, "oc_group")
+        self.assertEqual(event.source.thread_id, "omt_thread")
+        self.assertEqual(event.reply_to_message_id, "om_parent")
+        self.assertEqual(event.reply_to_text, "parent question")
+        self.assertEqual(event.metadata["feishu_mentions"][0].name, "Hermes")
+        self.assertTrue(event.metadata["feishu_mentions"][0].is_self)
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_mention_injects_cached_pdf_path_from_prior_unmentioned_file(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -5947,12 +6009,8 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
         event = adapter._dispatch_inbound_event.call_args.args[0]
         self.assertEqual(event.text, "stop pinging @Hermes please")
 
-    def test_pure_self_mention_message_is_ignored(self):
-        """A message containing only '@Bot' (no body, no media) must not dispatch.
-
-        Regression guard: the rendered '@Hermes' slips past the pre-strip empty
-        guard; the post-strip guard must catch it.
-        """
+    def test_pure_self_mention_message_uses_default_prompt(self):
+        """A message containing only '@Bot' still dispatches with usable text."""
         adapter = self._build_adapter()
         bot_mention = SimpleNamespace(
             key="@_user_1",
@@ -5975,7 +6033,10 @@ class TestFeishuProcessInboundMessage(unittest.TestCase):
                 chat_type="group", message_id="m5",
             )
         )
-        adapter._dispatch_inbound_event.assert_not_called()
+        event = adapter._dispatch_inbound_event.call_args.args[0]
+        self.assertEqual(event.text, "How can I help?")
+        self.assertEqual(event.metadata["feishu_mentions"][0].name, "Hermes")
+        self.assertTrue(event.metadata["feishu_mentions"][0].is_self)
 
 
 class TestFeishuFetchMessageText(unittest.TestCase):

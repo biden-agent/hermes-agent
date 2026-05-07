@@ -3377,10 +3377,11 @@ class FeishuAdapter(BasePlatformAdapter):
 
         if inbound_type == MessageType.TEXT:
             text = _strip_edge_self_mentions(text, mentions)
+            if not text and any(ref.is_self for ref in mentions):
+                text = "How can I help?"
             if text.startswith("/"):
                 inbound_type = MessageType.COMMAND
 
-        # Guard runs post-strip so a pure "@Bot" message (stripped to "") is dropped.
         if inbound_type == MessageType.TEXT and not text and not media_urls:
             logger.debug("[Feishu] Ignoring empty text message id=%s", message_id)
             return
