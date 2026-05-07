@@ -3246,6 +3246,74 @@ class TestAdapterBehavior(unittest.TestCase):
         self.assertTrue(captured["request"].request_body.reply_in_thread)
 
     @patch.dict(os.environ, {}, clear=True)
+    def test_build_outbound_payload_renders_known_inbound_mentions_as_at_elements(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter, FeishuMentionRef
+
+        adapter = FeishuAdapter(PlatformConfig())
+
+        msg_type, payload = adapter._build_outbound_payload(
+            "收到 @白芒 和 @未知",
+            metadata={"feishu_mentions": [FeishuMentionRef(name="白芒", open_id="ou_baimang")]},
+        )
+
+        self.assertEqual(msg_type, "post")
+        content = json.loads(payload)["zh_cn"]["content"]
+        self.assertEqual(
+            content,
+            [[
+                {"tag": "text", "text": "收到 "},
+                {"tag": "at", "user_id": "ou_baimang"},
+                {"tag": "text", "text": " 和 @未知"},
+            ]],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_process_message_background_preserves_feishu_mentions_in_response_metadata(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.platforms.feishu import FeishuAdapter, FeishuMentionRef
+
+        adapter = FeishuAdapter(PlatformConfig())
+        source = adapter.build_source(
+            chat_id="oc_chat",
+            chat_name="Feishu Chat",
+            chat_type="group",
+            user_id="ou_sender",
+            user_name="Sender",
+            thread_id="omt-thread",
+        )
+        event = MessageEvent(
+            text="@白芒 ping",
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id="om_in",
+            metadata={"feishu_mentions": [FeishuMentionRef(name="白芒", open_id="ou_baimang")]},
+        )
+        captured = {}
+
+        async def _handler(_event):
+            return "回复 @白芒"
+
+        async def _send_with_retry(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(success=True, message_id="om_out")
+
+        async def _run():
+            session_key = "feishu:oc_chat"
+            current = asyncio.current_task()
+            adapter._active_sessions[session_key] = asyncio.Event()
+            adapter._session_tasks[session_key] = current
+            adapter._message_handler = _handler
+            adapter._send_with_retry = _send_with_retry
+            await adapter._process_message_background(event, session_key)
+
+        asyncio.run(_run())
+
+        self.assertEqual(captured["metadata"]["thread_id"], "omt-thread")
+        self.assertEqual(captured["metadata"]["feishu_mentions"], event.metadata["feishu_mentions"])
+
+    @patch.dict(os.environ, {}, clear=True)
     def test_send_retries_transient_failure(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter

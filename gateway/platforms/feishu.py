@@ -603,6 +603,83 @@ def _build_markdown_post_payload(content: str) -> str:
     )
 
 
+def _build_mention_post_payload(content: str, mentions: Sequence[FeishuMentionRef]) -> str:
+    rows = _render_feishu_mentions_in_rows([[{"tag": "text", "text": content}]], mentions)
+    return json.dumps({"zh_cn": {"content": rows}}, ensure_ascii=False)
+
+
+def _build_markdown_post_payload_with_mentions(content: str, mentions: Sequence[FeishuMentionRef]) -> str:
+    rows = _render_feishu_mentions_in_rows(_build_markdown_post_rows(content), mentions)
+    return json.dumps({"zh_cn": {"content": rows}}, ensure_ascii=False)
+
+
+def _outbound_mention_refs(metadata: Optional[Dict[str, Any]]) -> List[FeishuMentionRef]:
+    if not isinstance(metadata, dict):
+        return []
+    raw_mentions = metadata.get("feishu_mentions")
+    if not isinstance(raw_mentions, list):
+        return []
+
+    refs: List[FeishuMentionRef] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw_mentions:
+        if isinstance(item, FeishuMentionRef):
+            ref = item
+        elif isinstance(item, dict):
+            ref = FeishuMentionRef(
+                name=str(item.get("name") or ""),
+                open_id=str(item.get("open_id") or ""),
+                is_all=bool(item.get("is_all")),
+                is_self=bool(item.get("is_self")),
+            )
+        else:
+            continue
+        if ref.is_all or ref.is_self or not ref.name or not ref.open_id:
+            continue
+        key = (ref.name, ref.open_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        refs.append(ref)
+    refs.sort(key=lambda ref: len(ref.name), reverse=True)
+    return refs
+
+
+def _render_feishu_mentions_in_rows(
+    rows: List[List[Dict[str, Any]]],
+    mentions: Sequence[FeishuMentionRef],
+) -> List[List[Dict[str, Any]]]:
+    if not mentions:
+        return rows
+    pattern = re.compile("|".join(re.escape(f"@{ref.name}") for ref in mentions))
+    refs_by_token = {f"@{ref.name}": ref for ref in mentions}
+
+    rendered_rows: List[List[Dict[str, Any]]] = []
+    for row in rows:
+        rendered_row: List[Dict[str, Any]] = []
+        for element in row:
+            tag = element.get("tag")
+            text = element.get("text")
+            if tag not in {"md", "text"} or not isinstance(text, str):
+                rendered_row.append(element)
+                continue
+
+            pos = 0
+            for match in pattern.finditer(text):
+                if match.start() > pos:
+                    rendered_row.append({"tag": tag, "text": text[pos:match.start()]})
+                ref = refs_by_token.get(match.group(0))
+                if ref:
+                    rendered_row.append({"tag": "at", "user_id": ref.open_id})
+                else:
+                    rendered_row.append({"tag": tag, "text": match.group(0)})
+                pos = match.end()
+            if pos < len(text):
+                rendered_row.append({"tag": tag, "text": text[pos:]})
+        rendered_rows.append(rendered_row or row)
+    return rendered_rows
+
+
 def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     """Build Feishu post rows while isolating fenced code blocks.
 
@@ -1859,7 +1936,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk)
+                msg_type, payload = self._build_outbound_payload(chunk, metadata=metadata)
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -3370,6 +3447,7 @@ class FeishuAdapter(BasePlatformAdapter):
             media_types=media_types,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            metadata={"feishu_mentions": mentions} if mentions else {},
             timestamp=datetime.now(),
         )
         normalized._feishu_relation_kind = str(  # type: ignore[attr-defined]
@@ -3857,12 +3935,28 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         existing.text = next_text
+        self._merge_text_batch_metadata(existing, event)
         existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
         existing.timestamp = event.timestamp
         if event.message_id:
             existing.message_id = event.message_id
         self._pending_text_batch_counts[key] = next_count
         self._schedule_text_batch_flush(key)
+
+    @staticmethod
+    def _merge_text_batch_metadata(existing: MessageEvent, incoming: MessageEvent) -> None:
+        existing_metadata = getattr(existing, "metadata", None)
+        incoming_metadata = getattr(incoming, "metadata", None)
+        if not isinstance(existing_metadata, dict) or not isinstance(incoming_metadata, dict):
+            return
+        existing_mentions = existing_metadata.get("feishu_mentions")
+        incoming_mentions = incoming_metadata.get("feishu_mentions")
+        if not isinstance(incoming_mentions, list):
+            return
+        if not isinstance(existing_mentions, list):
+            existing_metadata["feishu_mentions"] = list(incoming_mentions)
+            return
+        existing_mentions.extend(incoming_mentions)
 
     def _schedule_text_batch_flush(self, key: str) -> None:
         """Reset the debounce timer for a pending Feishu text batch."""
@@ -4752,15 +4846,21 @@ class FeishuAdapter(BasePlatformAdapter):
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str) -> tuple[str, str]:
+    def _build_outbound_payload(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
         # Force plain text for anything that looks like a markdown table.
         if _MARKDOWN_TABLE_RE.search(content):
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
+        mention_refs = _outbound_mention_refs(metadata)
+        has_known_mention = any(f"@{ref.name}" in content for ref in mention_refs)
         if _MARKDOWN_HINT_RE.search(content):
+            if has_known_mention:
+                return "post", _build_markdown_post_payload_with_mentions(content, mention_refs)
             return "post", _build_markdown_post_payload(content)
+        if has_known_mention:
+            return "post", _build_mention_post_payload(content, mention_refs)
         text_payload = {"text": content}
         return "text", json.dumps(text_payload, ensure_ascii=False)
 

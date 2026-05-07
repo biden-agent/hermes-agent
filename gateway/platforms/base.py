@@ -909,13 +909,17 @@ class MessageEvent:
     # Per-channel ephemeral system prompt (e.g. Discord channel_prompts).
     # Applied at API call time and never persisted to transcript history.
     channel_prompt: Optional[str] = None
-    
+
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.
     internal: bool = False
 
     # Timestamps
     timestamp: datetime = field(default_factory=datetime.now)
+
+    # Platform-specific context that should be available to the outbound reply
+    # path, such as Feishu's inbound mention refs for real @ rendering.
+    metadata: Dict[str, Any] = field(default_factory=dict)
     
     def is_command(self) -> bool:
         """Check if this is a command message (e.g., /new, /reset)."""
@@ -2749,7 +2753,11 @@ class BasePlatformAdapter(ABC):
         self._active_sessions[session_key] = interrupt_event
         
         # Start continuous typing indicator (refreshes every 2 seconds)
-        _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        _thread_metadata = dict(getattr(event, "metadata", None) or {})
+        if event.source.thread_id:
+            _thread_metadata["thread_id"] = event.source.thread_id
+        if not _thread_metadata:
+            _thread_metadata = None
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
