@@ -463,6 +463,10 @@ def _make_feishu_adapter():
     adapter._pending_text_batches = batch_state.events
     adapter._pending_text_batch_tasks = batch_state.tasks
     adapter._pending_text_batch_counts = batch_state.counts
+    adapter._pending_text_batch_inflight_counts = batch_state.inflight_counts
+    adapter._text_batch_inflight_poll_seconds = 0.01
+    adapter._text_batch_inflight_max_wait_seconds = 0.0
+    adapter._text_batch_inbound_locks = {}
     adapter._text_batch_delay_seconds = 0.1
     adapter._text_batch_split_delay_seconds = 0.3
     adapter._text_batch_max_messages = 20
