@@ -1,0 +1,404 @@
+# Aiden 私有分支与官方 Hermes Agent 差异记录
+
+> 生成时间：2026-05-08  
+> 仓库：`/Users/dev/.hermes/hermes-agent`  
+> 本地私有分支：`main` / `origin/main` (`git@github.com:aiden-lightning/hermes-agent.git`)  
+> 官方上游：`upstream/main` (`https://github.com/NousResearch/hermes-agent.git`)
+
+本文记录 `biden-agent` 与 `aiden-lightning` 两个 Git 作者在私有分支上相对官方代码保留的主要改动，用于后续同步上游、排查行为差异、以及判断哪些补丁需要继续维护或尝试 upstream。
+
+## 1. 当前分叉状态
+
+基于 `git fetch --all --prune` 后的结果：
+
+- `main` 相对 `upstream/main`：ahead **50** commits，behind **219** commits。
+- `main` 与 `origin/main` 同步，工作区干净。
+- 私有 ahead commits 作者分布：
+  - `Lightning@Aiden <aiden-lightning@users.noreply.github.com>`：33 个 commit
+  - `Biden@Aiden <biden-agent@users.noreply.github.com>`：17 个 commit
+- 注意：差异里有大量上游前进带来的文件级差异（例如上游删除/重构、测试清理等），不一定都是 Aiden 私有功能；本文重点按私有作者 commit 主题归纳。
+
+## 2. 私有改动总览
+
+### 2.1 Feishu / Lark 深度增强
+
+这是私有分支最大的差异区域，核心文件主要是：
+
+- `gateway/platforms/feishu.py`
+- `gateway/run.py`
+- `gateway/platforms/base.py`
+- `gateway/session.py`
+- `gateway/session_context.py`
+- `tools/feishu_doc_tool.py`
+- `tools/feishu_bitable_tool.py`
+- `tools/send_message_tool.py`
+- `toolsets.py`
+- `website/docs/user-guide/messaging/feishu.md`
+- 相关测试：`tests/gateway/test_feishu*.py`、`tests/tools/test_feishu_tools.py` 等
+
+主要差异：
+
+1. **群聊触发策略与开放策略**
+   - 支持 `FEISHU_REQUIRE_MENTION` / `require_mention`，允许配置群聊是否必须 @ 机器人才触发。
+   - 支持开放群策略（历史记录中称为 `FEISHU_GROUP_POLICY=open`）。
+   - 相关 commit：`c83d9a64b feat(feishu): configurable requireMention, admin-only approval, open group policy`。
+
+2. **审批卡片与安全交互**
+   - 增强 Feishu 危险命令审批卡片行为。
+   - 私有分支经历过“admin-only approval”到“remove approval admin gate”，后续又加入 **审批卡点击鉴权**。
+   - 卡片点击按原请求者 / 管理员 / stable ID 匹配校验，后续补充 union_id 匹配。
+   - 相关 commit：
+     - `4e7af834a fix(feishu): remove approval admin gate`
+     - `91bff3d65 fix(feishu): gate approval card actions`
+     - `947bb8290 fix(feishu): match approval clicks by union id`
+     - `7da61a377 test(feishu): close approval callback coroutines`
+
+3. **Feishu 原生媒体、线程和消息路由**
+   - 改进 Feishu native media delivery：文件、图片、语音等 `MEDIA:` 路由更贴近 Feishu adapter 的原生发送能力。
+   - 改进 thread routing / parent message 处理。
+   - 对 `edit_message` 临时传输错误增加重试。
+   - 相关 commit：
+     - `ffb77ebe1 fix: improve Feishu native media delivery and thread routing`
+     - `d74575453 fix: retry transient Feishu edit_message transport failures`
+
+4. **Feishu 文档 / 多维表格工具**
+   - `feishu_doc_read` 能脱离 comment context 使用。
+   - 支持解析 Feishu wiki token 到真实 doc/bitable token。
+   - 新增 `feishu_bitable_read` 工具，读取 Feishu/Lark Bitable。
+   - 相关 commit：
+     - `3a41a0995 fix: make feishu_doc_read work outside comment context`
+     - `1fef6af79 fix: resolve wiki tokens in feishu_doc_read`
+     - `08352cb0d feat(feishu): add bitable read tool`
+
+5. **群上下文、附件、批处理与多用户隔离**
+   - 在 mention gate 前缓存 Feishu group context，避免因为未触发而丢失后续可用上下文。
+   - 修复群附件上下文保存。
+   - 修复跨用户 text batch merge，避免不同用户快速消息被合并到同一批。
+   - 修复快速 DM 批处理顺序。
+   - 相关 commit：
+     - `c2b43450e feat: cache feishu group context before mention gate`
+     - `45f7ae97e fix(feishu): preserve group attachment context`
+     - `70ba5a1fe fix(feishu): prevent cross-user text batch merging`
+     - `0120a899b fix(feishu): preserve rapid DM batch ordering`
+
+6. **Feishu session/search/bot history 隔离**
+   - 隔离 session search，防止跨用户或跨上下文泄漏。
+   - 保留 bot history，改善 Feishu 群聊/会话连续性。
+   - 相关 commit：`0781016af fix(feishu): isolate session search and preserve bot history`。
+
+7. **Feishu reaction 行为**
+   - 只对 Hermes 自己发送并记录过的消息路由 reaction，避免对同一 Feishu app 发出的无关卡片误触发。
+   - 引入 scoped no-reply sentinel，用于 reaction 经 agent 判断后不必回复时抑制可见发送。
+   - 相关 commit：
+     - `8baaaf97b fix(feishu): restrict reaction routing to sent messages`
+     - `2b7472e3d fix(feishu): suppress no-op reaction replies`
+
+8. **出站 @mention 渲染**
+   - 记录 inbound mention refs，用于后续 outbound `@name` 渲染为 Feishu 真正的 `<at>` 元素。
+   - 处理只包含 mention 的消息。
+   - 相关 commit：
+     - `b5ee187a0 fix(feishu): render known outbound mentions`
+     - `448b8b3fb fix(feishu): handle mention-only messages`
+     - `211b9037c feat(feishu): persist inbound mention refs for outbound at`
+
+9. **Feishu 用户级命令 / 工具权限**
+   - 增加 per-user command and tool permissions，允许对 Feishu 用户维度限制命令或工具访问。
+   - 相关 commit：`dde29c4d2 feat(feishu): add per-user command and tool permissions`。
+
+### 2.2 Gateway 生命周期、重启、排队与可观测性
+
+相关文件主要是：
+
+- `gateway/run.py`
+- `gateway/platforms/base.py`
+- `gateway/session_context.py`
+- `hermes_logging.py`
+- `run_agent.py`
+- `tools/approval.py`
+- `tools/terminal_tool.py`
+- `tools/process_registry.py`
+
+主要差异：
+
+1. **Gateway watcher / background process delivery / teardown 加固**
+   - 后台进程通知和 watcher delivery 更稳健。
+   - 关闭/清理路径更健壮。
+   - 相关 commit：`47f1b3abb fix: harden gateway watcher delivery and teardown`。
+
+2. **Gateway restart/resume 行为**
+   - 加固 gateway restart。
+   - preserve restart resume state，减少重启中断后 session 状态丢失。
+   - 相关 commit：
+     - `0b3f74876 fix: harden gateway restart and opencode delegation`
+     - `abdc3b16a fix(gateway): preserve restart resume state`
+     - `5ab54fe46 test(gateway): isolate systemd preflight in service tests`
+
+3. **Queued handoff interrupt 修复**
+   - 清理 queued handoff interrupt，避免 pending/queued 消息处理时泄漏旧中断状态。
+   - 相关 commit：`e8671a99f fix(gateway): clear queued handoff interrupt`。
+
+4. **Gateway 状态显示**
+   - `/status` 或 gateway status 中显示模型信息。
+   - 相关 commit：`7b35d5da1`、`55ad90a97`，同名 `fix: show model info in gateway status`。
+
+5. **日志级别与原始可观测性 tracing**
+   - `gateway.log` 恢复/覆盖 logging coverage，并尊重 gateway debug level。
+   - 增加 raw observability tracing，改进审批、Feishu、agent 运行路径的诊断能力。
+   - 相关 commit：
+     - `d9b95fd64 fix(logging): restore logging coverage and honor gateway debug level`
+     - `0c5f107f4 fix(gateway): add raw observability tracing`
+     - `7e336375e test(logging): cover observability redaction`
+
+### 2.3 Cron job 网关安全隔离
+
+相关文件：
+
+- `cron/jobs.py`
+- `gateway/run.py`
+- `gateway/session_context.py`
+- `tools/cronjob_tools.py`
+- `tests/cron/test_scheduler.py`
+- `tests/tools/test_cronjob_tools.py`
+
+主要差异：
+
+- Gateway 创建的 cron jobs 记录 owner metadata。
+- 普通 gateway 用户只能管理自己的 job。
+- Future run 继承并限制原会话 toolsets，避免 cronjob 递归调度或权限膨胀。
+- 相关 commit：`76ef4f4d1 fix: isolate gateway cron jobs by user`。
+
+### 2.4 Safe curl 工具与私网 URL 安全语义
+
+相关文件：
+
+- `tools/curl_tool.py`
+- `tools/url_safety.py`
+- `tools/browser_tool.py`
+- `hermes_cli/tools_config.py`
+- `toolsets.py`
+- `website/docs/user-guide/features/browser.md`
+
+主要差异：
+
+1. **新增 safe curl tool**
+   - 新增 `curl` 工具，用于安全 HTTP/HTTPS 请求。
+   - 默认阻止 localhost、私网、metadata/link-local 等敏感目标。
+   - 相关 commit：`c5b069450 feat(tools): add safe curl tool`。
+
+2. **私网 URL allow 配置统一**
+   - curl 与 browser SSRF/private URL 安全策略统一。
+   - 支持 `security.allow_private_urls`，兼容旧 `browser.allow_private_urls`。
+   - 即便允许私网，metadata 与 `169.254.0.0/16` 仍阻止。
+   - 相关 commit：
+     - `416e871b9 fix(curl): honor private URL allow config`
+     - `39ccf72ce fix(security): unify private URL allow semantics`
+
+### 2.5 Browser / CDP 稳定性
+
+相关文件：
+
+- `tools/browser_tool.py`
+- `tools/browser_cdp_tool.py`
+- `tui_gateway/server.py`
+- `tests/tools/test_browser_connect_tool.py`
+- `tests/tools/test_browser_cdp_tool.py`
+- `tests/tools/test_browser_console.py`
+
+主要差异：
+
+- 改进 CDP-backed browser sessions。
+- 支持 async CDP websocket factories，兼容不同 `websockets.connect` 运行时行为。
+- 增强 browser connect / console 相关测试。
+- 相关 commit：
+  - `e3fcdf221 fix(browser): improve CDP-backed sessions`
+  - `ac66429d6 fix(browser): support async CDP websocket factories`
+
+### 2.6 TTS：MOSS-TTS-Nano 本地 ONNX Provider
+
+相关文件：
+
+- `.gitmodules`
+- `moss_tts_nano_repo`（submodule）
+- `tools/tts_tool.py`
+- `hermes_cli/config.py`
+- `hermes_cli/setup.py`
+- `hermes_cli/web_server.py`
+- `tests/tools/test_tts_moss.py`
+- `tests/tools/test_tts_max_text_length.py`
+
+主要差异：
+
+- 新增 `MOSS-TTS-Nano` 本地 ONNX TTS provider。
+- 加入合成输出校验与 ffmpeg failure 处理。
+- 保持 MOSS OGG 输出 Telegram-safe。
+- 增加输出验证测试。
+- 相关 commit：
+  - `a1ed70d05 feat(tts): add MOSS-TTS-Nano local ONNX provider support`
+  - `8a79a070a fix(tts): validate MOSS synthesize output and handle ffmpeg failures`
+  - `aca83f416 fix(tts): keep MOSS ogg output Telegram-safe`
+  - `63a7dc16d test(tts): add output validation tests for MOSS provider`
+
+### 2.7 Image generation：OpenRouter GPT-5.4 Image 2
+
+相关文件：
+
+- `plugins/image_gen/openai/__init__.py`
+- `tests/plugins/image_gen/test_openai_provider.py`
+
+主要差异：
+
+- OpenAI-compatible image provider 支持 OpenRouter `GPT-5.4 Image 2`。
+- 相关 commit：`a14734e1d fix(image-gen): support OpenRouter GPT-5.4 Image 2`。
+
+### 2.8 Model metadata / custom endpoint probe 缓存
+
+相关文件：
+
+- `agent/model_metadata.py`
+- `tests/agent/test_model_metadata_local_ctx.py`
+
+主要差异：
+
+- 对 custom endpoint context length probe 失败结果做持久化缓存，降低重复失败探测和日志噪音。
+- 相关 commit：`dd2e14bd7 fix: persist failed custom endpoint context probes`。
+
+### 2.9 OpenCode / delegation / terminal PTY 相关加固
+
+相关文件：
+
+- `agent/copilot_acp_client.py`
+- `skills/autonomous-ai-agents/opencode/SKILL.md`
+- `tools/terminal_tool.py`
+- `gateway/run.py`
+- 相关测试
+
+主要差异：
+
+- 加固 gateway restart 相关路径时，同时更新 OpenCode delegation 使用说明和 terminal/PTY 行为测试。
+- 相关 commit：`0b3f74876 fix: harden gateway restart and opencode delegation`。
+
+## 3. 作者维度 commit 清单
+
+### 3.1 `Biden@Aiden <biden-agent@users.noreply.github.com>`
+
+非 merge 私有 commits：
+
+- `c83d9a64b` — `feat(feishu): configurable requireMention, admin-only approval, open group policy`
+- `7b35d5da1` — `fix: show model info in gateway status`
+- `55ad90a97` — `fix: show model info in gateway status`
+- `ffb77ebe1` — `fix: improve Feishu native media delivery and thread routing`
+- `a1ed70d05` — `feat(tts): add MOSS-TTS-Nano local ONNX provider support`
+- `8a79a070a` — `fix(tts): validate MOSS synthesize output and handle ffmpeg failures`
+- `aca83f416` — `fix(tts): keep MOSS ogg output Telegram-safe`
+- `63a7dc16d` — `test(tts): add output validation tests for MOSS provider`
+- `a14734e1d` — `fix(image-gen): support OpenRouter GPT-5.4 Image 2`
+- `3a41a0995` — `fix: make feishu_doc_read work outside comment context`
+- `1fef6af79` — `fix: resolve wiki tokens in feishu_doc_read`
+- `08352cb0d` — `feat(feishu): add bitable read tool`
+- `47f1b3abb` — `fix: harden gateway watcher delivery and teardown`
+- `d74575453` — `fix: retry transient Feishu edit_message transport failures`
+- `dd2e14bd7` — `fix: persist failed custom endpoint context probes`
+
+Merge commits：
+
+- `16ddef33a` — `Merge upstream main (124 commits) — keep feishu patches`
+- `7954e46cf` — `Merge remote-tracking branch 'origin/main' into private-origin-sync`
+
+### 3.2 `Lightning@Aiden <aiden-lightning@users.noreply.github.com>`
+
+非 merge 私有 commits：
+
+- `0b3f74876` — `fix: harden gateway restart and opencode delegation`
+- `4e7af834a` — `fix(feishu): remove approval admin gate`
+- `dde29c4d2` — `feat(feishu): add per-user command and tool permissions`
+- `c2b43450e` — `feat: cache feishu group context before mention gate`
+- `d9b95fd64` — `fix(logging): restore logging coverage and honor gateway debug level`
+- `91bff3d65` — `fix(feishu): gate approval card actions`
+- `c5b069450` — `feat(tools): add safe curl tool`
+- `8baaaf97b` — `fix(feishu): restrict reaction routing to sent messages`
+- `76ef4f4d1` — `fix: isolate gateway cron jobs by user`
+- `70ba5a1fe` — `fix(feishu): prevent cross-user text batch merging`
+- `0781016af` — `fix(feishu): isolate session search and preserve bot history`
+- `45f7ae97e` — `fix(feishu): preserve group attachment context`
+- `e8671a99f` — `fix(gateway): clear queued handoff interrupt`
+- `947bb8290` — `fix(feishu): match approval clicks by union id`
+- `7da61a377` — `test(feishu): close approval callback coroutines`
+- `e3fcdf221` — `fix(browser): improve CDP-backed sessions`
+- `ac66429d6` — `fix(browser): support async CDP websocket factories`
+- `abdc3b16a` — `fix(gateway): preserve restart resume state`
+- `416e871b9` — `fix(curl): honor private URL allow config`
+- `39ccf72ce` — `fix(security): unify private URL allow semantics`
+- `0120a899b` — `fix(feishu): preserve rapid DM batch ordering`
+- `0c5f107f4` — `fix(gateway): add raw observability tracing`
+- `7e336375e` — `test(logging): cover observability redaction`
+- `5ab54fe46` — `test(gateway): isolate systemd preflight in service tests`
+- `b5ee187a0` — `fix(feishu): render known outbound mentions`
+- `448b8b3fb` — `fix(feishu): handle mention-only messages`
+- `211b9037c` — `feat(feishu): persist inbound mention refs for outbound at`
+- `2b7472e3d` — `fix(feishu): suppress no-op reaction replies`
+
+Merge commits：
+
+- `5c6bed00c` — `Merge branch 'private-main-update'`
+- `b81bd346a` — `Merge remote-tracking branch 'origin/main'`
+- `3fa08f28b` — `Merge remote-tracking branch 'upstream/main'`
+- `5ca69483e` — `Merge remote-tracking branch 'upstream/main'`
+- `32ac6beff` — `Merge remote-tracking branch 'upstream/main'`
+
+## 4. 高风险维护点
+
+1. **Feishu adapter 差异很大**
+   - `gateway/platforms/feishu.py` 是最大冲突点。
+   - 每次合并上游 Feishu / gateway 改动都要重点复核：mention gate、reaction、approval、media、batching、session metadata。
+
+2. **Gateway run/session 改动分散**
+   - `gateway/run.py` 同时承载 restart、cron ACL、Feishu permissions、raw tracing、no-reply suppression 等多类私有逻辑。
+   - 上游 gateway 生命周期改动容易与这些逻辑冲突。
+
+3. **安全语义需要持续一致**
+   - `curl`、browser SSRF、private URL allow、cron owner ACL、Feishu approval click auth 都属于安全相关差异。
+   - 不应在同步上游时为了解冲突而简单删除测试。
+
+4. **MOSS-TTS-Nano submodule 是私有依赖点**
+   - `.gitmodules` 与 `moss_tts_nano_repo` 需要在 clone/update 时保持可用。
+   - 相关测试应确保无模型权重环境下仍可 mock 通过。
+
+5. **当前 branch behind upstream/main 219 commits**
+   - 官方代码已经继续前进，文件级 diff 包含很多“上游新增而私有分支未同步”的差异。
+   - 真正私有功能应优先以 commit 主题和局部 diff 审核，而不是直接把 `git diff upstream/main..main` 全量视为私有 patch。
+
+## 5. 建议的后续维护方式
+
+1. **把私有补丁拆成主题分支或 patch stack**
+   - `feishu-core`
+   - `feishu-security-approval`
+   - `feishu-doc-bitable-tools`
+   - `gateway-restart-observability`
+   - `gateway-cron-acl`
+   - `safe-curl-url-safety`
+   - `moss-tts`
+   - `browser-cdp-stability`
+
+2. **每次同步上游后跑最小回归集**
+
+   ```bash
+   scripts/run_tests.sh \
+     tests/gateway/test_feishu.py \
+     tests/gateway/test_feishu_approval_buttons.py \
+     tests/gateway/test_feishu_command_permissions.py \
+     tests/gateway/test_no_reply_sentinel.py \
+     tests/tools/test_feishu_tools.py \
+     tests/tools/test_curl_tool.py \
+     tests/tools/test_url_safety.py \
+     tests/tools/test_browser_cdp_tool.py \
+     tests/tools/test_browser_connect_tool.py \
+     tests/tools/test_tts_moss.py \
+     tests/tools/test_cronjob_tools.py
+   ```
+
+3. **同步前先确认是否已有上游等价实现**
+   - Feishu native tools、cron ACL、safe curl、browser CDP、reaction no-reply 这类功能未来可能被官方吸收或重写。
+   - 如果上游已有等价实现，应优先收敛到上游实现，减少私有维护面。
+
+4. **保留此文档作为差异索引**
+   - 后续新增私有 commit 时，在本文追加主题、commit 和测试入口。
