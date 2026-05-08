@@ -108,6 +108,112 @@ Types: `feat`, `fix`, `refactor`, `docs`, `test`, `ci`, `chore`, `perf`
 git push -u origin HEAD
 ```
 
+### Force-update prohibition for shared branches
+
+Do **not** rewrite remote history on shared branches (especially `main`, release branches, or any branch other people may consume). This includes:
+
+- `git push --force`
+- `git push --force-with-lease`
+- amended commits already pushed to a shared branch
+- rebase/squash followed by a forced update
+
+Only perform a force update when the user explicitly requests a force update in the same message **and** states the target remote and branch. If a pushed commit needs correction and the user did not explicitly authorize a force update, create a normal follow-up commit instead of amending and force-pushing. Dangerous-command approval is not enough by itself; the user instruction must authorize the force update.
+
+Before any push, inspect the current branch and remotes instead of assuming `origin` is the correct destination:
+
+```bash
+git branch --show-current
+git remote -v
+git log --oneline -1
+```
+
+Use this especially when:
+- the repo has more than one writable remote
+- `origin` points to upstream, while a different remote points to the writable fork/private repo
+- the project intentionally allows direct pushes to `main` without a PR
+
+If a push to `origin` fails with permission errors such as:
+
+```text
+remote: Permission to <upstream-owner>/<repo>.git denied to <user>.
+fatal: unable to access 'https://github.com/<upstream-owner>/<repo>.git/': The requested URL returned error: 403
+```
+
+then do not retry blindly. Diagnose the destination first:
+
+```bash
+git remote -v
+git branch -vv
+git rev-parse HEAD
+```
+
+Interpretation:
+- `origin` may be the read-only upstream project
+- a separate remote such as `private` or `fork` may be the actual writable destination
+- the current branch may still be tracking `origin/main` even when the user wants the commit pushed elsewhere
+
+Preferred recovery:
+
+```bash
+# Push explicitly to the writable remote
+git push <remote> HEAD:main
+
+# Example
+git push private HEAD:main
+```
+
+When reporting status back to the user, include:
+- the local commit SHA
+- which remote rejected the push
+- which alternate remote(s) exist
+- whether the branch is ahead of `origin/main` only locally
+
+For direct-to-main repositories, prefer an explicit push target so you do not accidentally update the wrong remote or branch:
+
+```bash
+git push <remote> HEAD:main
+```
+
+Example:
+
+```bash
+git push private HEAD:main
+```
+
+Only use the explicit direct-to-main form when the repo workflow really allows it; otherwise follow the normal branch + PR flow below.
+
+### Verify push actually advanced the intended remote
+
+A successful shell exit from `git push` is not enough. Read the push output and verify the target state before continuing to downstream side effects such as restart/deploy.
+
+Required checks when a commit/push is expected:
+
+```bash
+git status --short --branch
+git log --oneline -1
+git diff --stat HEAD~1 HEAD  # if you just committed
+```
+
+Interpretation:
+- Output like `oldsha..newsha HEAD -> main` means the remote branch advanced.
+- Output like `Everything up-to-date` is only acceptable when no new commit was expected. If the user expected a new change to be pushed, treat this as a stop signal: find where the change was made, whether it is outside the git repo, whether it was staged/committed, or whether you are in the wrong repository.
+- Do not run downstream side effects (restart, deploy, release, notify) after an unexpected `Everything up-to-date`; first resolve the missing commit/push.
+- When a user later asks why push did not happen or asks to fix the push, only complete the missing commit/push work. Do not repeat already-completed side effects from the earlier command chain unless the user explicitly requests them again.
+
+For Hermes skills specifically, note that installed skills under `~/.hermes/skills/` are not the same as tracked repo skills under `/Users/dev/.hermes/hermes-agent/skills/`. If a skill edit should be committed/pushed, ensure the corresponding tracked file in the repo has the diff before committing.
+
+### No force updates unless explicitly requested
+
+Do not rewrite remote branch history as a cleanup shortcut. Forbidden unless the user explicitly requests a force update in the same message and states the target branch/remote:
+
+```bash
+git push --force
+git push --force-with-lease
+git push <remote> +HEAD:<branch>
+```
+
+If you already pushed a bad commit and need to correct it, create and push a normal follow-up fix commit. Do not `commit --amend` + force-push shared branches. If history rewriting is genuinely necessary, explain the exact remote/branch/SHA impact and wait for an explicit force-push instruction.
+
 ### Create the PR
 
 **With gh:**
