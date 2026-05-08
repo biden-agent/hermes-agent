@@ -6,6 +6,7 @@ import os
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict
@@ -736,6 +737,14 @@ def _admits_group(adapter, message, sender_id, chat_id=""):
     if chat_id:
         message.chat_id = chat_id
     return adapter._admit(sender, message) is None
+
+
+@contextmanager
+def _isolated_hermes_home():
+    """Run a test against an empty Hermes home, never the developer profile."""
+    with tempfile.TemporaryDirectory() as temp_home:
+        with patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            yield Path(temp_home)
 
 
 class TestAdapterBehavior(unittest.TestCase):
@@ -3329,6 +3338,1014 @@ class TestAdapterBehavior(unittest.TestCase):
                 {"tag": "text", "text": " 和 @未知"},
             ]],
         )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_inbound_mentions_are_persisted_under_hermes_home(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        from hermes_constants import get_hermes_home
+
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            adapter = FeishuAdapter(PlatformConfig())
+            message = SimpleNamespace(
+                message_id="om_mention_persist",
+                message_type="text",
+                content=json.dumps({"text": "请 @_user_1 看一下"}, ensure_ascii=False),
+                mentions=[
+                    SimpleNamespace(
+                        key="@_user_1",
+                        name="白芒",
+                        id=SimpleNamespace(open_id="ou_baimang"),
+                    )
+                ],
+            )
+
+            _text, _msg_type, _media_urls, _media_types, mentions = asyncio.run(adapter._extract_message_content(message))
+
+            self.assertEqual(mentions[0].open_id, "ou_baimang")
+            persistence_path = get_hermes_home() / "feishu_mention_refs.json"
+            self.assertTrue(persistence_path.exists())
+            payload = json.loads(persistence_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["mentions"]["白芒"]["open_id"], "ou_baimang")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_new_adapter_loads_persisted_inbound_mentions_before_api_lookup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            first_adapter = FeishuAdapter(PlatformConfig())
+            message = SimpleNamespace(
+                message_id="om_mention_reload",
+                message_type="text",
+                content=json.dumps({"text": "请 @_user_1 看一下"}, ensure_ascii=False),
+                mentions=[
+                    SimpleNamespace(
+                        key="@_user_1",
+                        name="白芒",
+                        id=SimpleNamespace(open_id="ou_baimang"),
+                    )
+                ],
+            )
+            asyncio.run(first_adapter._extract_message_content(message))
+
+            adapter = FeishuAdapter(PlatformConfig())
+
+            async def _unexpected_lookup(_query):
+                raise AssertionError("persisted mention should avoid API lookup")
+
+            with patch.object(adapter, "_search_visible_chat_member_mention", side_effect=_unexpected_lookup):
+                ref = asyncio.run(adapter._resolve_outbound_mention_ref("白芒"))
+
+            self.assertIsNotNone(ref)
+            self.assertEqual(ref.open_id, "ou_baimang")
+            self.assertEqual(ref.name, "白芒")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_resolves_persisted_inbound_mention_without_chat_member_api(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            path = Path(temp_home) / "feishu_mention_refs.json"
+            path.write_text(
+                json.dumps({"mentions": {"白芒": {"name": "白芒", "open_id": "ou_baimang"}}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {"lookup_calls": 0}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_persisted"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    captured["lookup_calls"] += 1
+                    raise AssertionError(f"persisted mention should avoid chat/member API: {request.uri}")
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["lookup_calls"], 0)
+            self.assertEqual(captured["request"].request_body.msg_type, "post")
+            content = json.loads(captured["request"].request_body.content)["zh_cn"]["content"]
+            self.assertEqual(content[0][1], {"tag": "at", "user_id": "ou_baimang"})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_conflicting_inbound_mentions_are_persisted_as_ambiguous_and_fail_closed(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter, FeishuMentionRef
+
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_lookup_chat_members": False}))
+            adapter._remember_inbound_mention_refs([FeishuMentionRef(name="白芒", open_id="ou_one")])
+            adapter._remember_inbound_mention_refs([FeishuMentionRef(name="白芒", open_id="ou_two")])
+
+            payload = json.loads((Path(temp_home) / "feishu_mention_refs.json").read_text(encoding="utf-8"))
+            self.assertNotIn("白芒", payload["mentions"])
+            self.assertEqual(payload["ambiguous"], ["白芒"])
+
+            reloaded = FeishuAdapter(PlatformConfig(extra={"outbound_mention_lookup_chat_members": False}))
+            self.assertIsNone(asyncio.run(reloaded._resolve_outbound_mention_ref("白芒")))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_newly_allocated_adapter_lazily_loads_persisted_mention_state(self):
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            path = Path(temp_home) / "feishu_mention_refs.json"
+            path.write_text(
+                json.dumps({"mentions": {"白芒": {"name": "白芒", "open_id": "ou_baimang"}}}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            adapter = FeishuAdapter.__new__(FeishuAdapter)
+
+            ref = asyncio.run(adapter._resolve_outbound_mention_ref("白芒"))
+
+            self.assertIsNotNone(ref)
+            self.assertEqual(ref.open_id, "ou_baimang")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_unknown_persisted_mention_lookup_remains_plain_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_plain_unknown"))
+
+            adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI())))
+
+            async def _lookup_miss(_query):
+                return None
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch.object(adapter, "_search_visible_chat_member_mention", side_effect=_lookup_miss), \
+                 patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @未知 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["request"].request_body.msg_type, "text")
+            self.assertEqual(
+                captured["request"].request_body.content,
+                json.dumps({"text": "请 @未知 看一下"}, ensure_ascii=False),
+            )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_missing_or_corrupt_persisted_mentions_file_does_not_crash(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+        from hermes_constants import get_hermes_home
+
+        with tempfile.TemporaryDirectory() as temp_home, patch.dict(os.environ, {"HERMES_HOME": temp_home}, clear=False):
+            adapter = FeishuAdapter(PlatformConfig())
+            self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("白芒")))
+
+            persistence_path = get_hermes_home() / "feishu_mention_refs.json"
+            persistence_path.write_text("{not json", encoding="utf-8")
+
+            adapter = FeishuAdapter(PlatformConfig())
+            self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("白芒")))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_outbound_mention_chat_member_lookup_page_sizes_clamp_to_lark_api_limit(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "outbound_mention_chat_page_size": 1000,
+                    "outbound_mention_member_page_size": 1000,
+                }
+            )
+        )
+
+        self.assertEqual(adapter._outbound_mention_chat_page_size, 100)
+        self.assertEqual(adapter._outbound_mention_member_page_size, 100)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_outbound_mention_lookup_enabled_by_default_searches_visible_chat_members(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {"uris": []}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(
+                        success=lambda: True,
+                        data=SimpleNamespace(message_id="om_contact_mention"),
+                    )
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    captured["uris"].append(request.uri)
+                    if request.uri == "/open-apis/directory/v1/employees/search":
+                        raise AssertionError("employee search must not be used for outbound mentions")
+                    if request.uri == "/open-apis/im/v1/chats":
+                        return SimpleNamespace(
+                            raw=SimpleNamespace(
+                                content=json.dumps(
+                                    {"code": 0, "data": {"items": [{"chat_id": "oc_visible"}], "has_more": False}},
+                                    ensure_ascii=False,
+                                ).encode("utf-8")
+                            )
+                        )
+                    if request.uri != "/open-apis/im/v1/chats/oc_visible/members":
+                        raise AssertionError(request.uri)
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "code": 0,
+                                    "data": {
+                                        "items": [
+                                            {"member_id": "ou_facecode", "member_id_type": "open_id", "name": "FaceCode"},
+                                        ],
+                                        "has_more": False,
+                                    },
+                                },
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @FaceCode 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["uris"], ["/open-apis/im/v1/chats", "/open-apis/im/v1/chats/oc_visible/members"])
+            self.assertEqual(captured["request"].request_body.msg_type, "post")
+            content = json.loads(captured["request"].request_body.content)["zh_cn"]["content"]
+            self.assertEqual(
+                content,
+                [[
+                    {"tag": "text", "text": "请 "},
+                    {"tag": "at", "user_id": "ou_facecode"},
+                    {"tag": "text", "text": " 看一下"},
+                ]],
+            )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_visible_chat_member_lookup_uses_expected_api_queries_and_tenant_token(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import AccessTokenType, FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(
+                PlatformConfig(
+                    extra={
+                        "outbound_mention_chat_page_size": 2,
+                        "outbound_mention_chat_max_pages": 2,
+                        "outbound_mention_member_page_size": 3,
+                        "outbound_mention_member_max_pages_per_chat": 2,
+                    }
+                )
+            )
+            captured = {"lookup_requests": []}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["send_request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_api_shape"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    captured["lookup_requests"].append(request)
+                    if request.uri == "/open-apis/im/v1/chats":
+                        has_page_token = ("page_token", "next_chats") in request.queries
+                        return SimpleNamespace(
+                            raw=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "code": 0,
+                                        "data": {
+                                            "items": [] if not has_page_token else [{"chat_id": "oc_visible"}],
+                                            "has_more": not has_page_token,
+                                            "page_token": "next_chats" if not has_page_token else "",
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                ).encode("utf-8")
+                            )
+                        )
+                    if request.uri == "/open-apis/im/v1/chats/oc_visible/members":
+                        has_page_token = ("page_token", "next_members") in request.queries
+                        return SimpleNamespace(
+                            raw=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "code": 0,
+                                        "data": {
+                                            "items": []
+                                            if not has_page_token
+                                            else [{"member_id": "ou_visible", "member_id_type": "open_id", "name": "Visible"}],
+                                            "has_more": not has_page_token,
+                                            "page_token": "next_members" if not has_page_token else "",
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                ).encode("utf-8")
+                            )
+                        )
+                    raise AssertionError(request.uri)
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="ping @Visible"))
+
+            self.assertTrue(result.success)
+            self.assertEqual([request.uri for request in captured["lookup_requests"]], [
+                "/open-apis/im/v1/chats",
+                "/open-apis/im/v1/chats",
+                "/open-apis/im/v1/chats/oc_visible/members",
+                "/open-apis/im/v1/chats/oc_visible/members",
+            ])
+            self.assertEqual(captured["lookup_requests"][0].queries, [("user_id_type", "open_id"), ("page_size", "2")])
+            self.assertEqual(captured["lookup_requests"][1].queries, [
+                ("user_id_type", "open_id"),
+                ("page_size", "2"),
+                ("page_token", "next_chats"),
+            ])
+            self.assertEqual(captured["lookup_requests"][2].queries, [("member_id_type", "open_id"), ("page_size", "3")])
+            self.assertEqual(captured["lookup_requests"][3].queries, [
+                ("member_id_type", "open_id"),
+                ("page_size", "3"),
+                ("page_token", "next_members"),
+            ])
+            for request in captured["lookup_requests"]:
+                self.assertEqual(request.token_types, {AccessTokenType.TENANT})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_outbound_mention_lookup_caches_positive_miss_ambiguous_and_failure_outcomes(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter, FeishuMentionRef
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_cache_ttl_seconds": 60}))
+
+            async def _positive(query):
+                return FeishuMentionRef(name=query, open_id="ou_cached")
+
+            async def _none(_query):
+                return None
+
+            async def _failure(_query):
+                raise RuntimeError("lookup failed")
+
+            async def _unexpected(_query):
+                raise AssertionError("cached outcome should avoid a second lookup")
+
+            with patch.object(adapter, "_search_visible_chat_member_mention", side_effect=_positive) as search:
+                self.assertEqual(asyncio.run(adapter._resolve_outbound_mention_ref("Positive")).open_id, "ou_cached")
+                search.side_effect = _unexpected
+                self.assertEqual(asyncio.run(adapter._resolve_outbound_mention_ref("Positive")).open_id, "ou_cached")
+                self.assertEqual(search.call_count, 1)
+
+            with patch.object(adapter, "_search_visible_chat_member_mention", side_effect=_none) as search:
+                self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("Missing")))
+                search.side_effect = _unexpected
+                self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("Missing")))
+                self.assertEqual(search.call_count, 1)
+
+            with patch.object(adapter, "_search_visible_chat_member_mention", side_effect=_none) as search:
+                self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("Ambiguous")))
+                search.side_effect = _unexpected
+                self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("Ambiguous")))
+                self.assertEqual(search.call_count, 1)
+
+            with patch.object(adapter, "_search_visible_chat_member_mention", side_effect=_failure) as search:
+                self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("Failure")))
+                search.side_effect = _unexpected
+                self.assertIsNone(asyncio.run(adapter._resolve_outbound_mention_ref("Failure")))
+                self.assertEqual(search.call_count, 1)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_does_not_use_employee_search_even_when_it_would_match(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_lookup": True}))
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_contact"))
+
+        class _Client:
+            im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+            def request(self, request):
+                if request.uri == "/open-apis/directory/v1/employees/search":
+                    raise AssertionError("employee search must not be used for outbound mentions")
+                if request.uri == "/open-apis/im/v1/chats":
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(
+                            content=json.dumps(
+                                {"code": 0, "data": {"items": [{"chat_id": "oc_visible"}], "has_more": False}},
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
+                if request.uri != "/open-apis/im/v1/chats/oc_visible/members":
+                    raise AssertionError(request.uri)
+                return SimpleNamespace(
+                    raw=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "code": 0,
+                                "data": {
+                                    "items": [{"member_id": "ou_lyuyi", "member_id_type": "open_id", "name": "LyuYi"}],
+                                    "has_more": False,
+                                },
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    )
+                )
+
+        adapter._client = _Client()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @LyuYi 看一下"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "post")
+        content = json.loads(captured["request"].request_body.content)["zh_cn"]["content"]
+        self.assertEqual(content[0][1], {"tag": "at", "user_id": "ou_lyuyi"})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_leaves_ambiguous_visible_chat_member_mention_as_plain_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_plain"))
+
+        class _Client:
+            im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+            def request(self, request):
+                if request.uri == "/open-apis/directory/v1/employees/search":
+                    raise AssertionError("employee search must not be used for outbound mentions")
+                if request.uri == "/open-apis/im/v1/chats":
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(
+                            content=json.dumps(
+                                {"code": 0, "data": {"items": [{"chat_id": "oc_one"}, {"chat_id": "oc_two"}], "has_more": False}},
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
+                member_id = "ou_alex_1" if request.uri.endswith("/oc_one/members") else "ou_alex_2"
+                return SimpleNamespace(
+                    raw=SimpleNamespace(
+                        content=json.dumps(
+                            {"code": 0, "data": {"items": [{"member_id": member_id, "member_id_type": "open_id", "name": "Alex"}], "has_more": False}},
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    )
+                )
+
+        adapter._client = _Client()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @Alex 看一下"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "text")
+        self.assertEqual(
+            captured["request"].request_body.content,
+            json.dumps({"text": "请 @Alex 看一下"}, ensure_ascii=False),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_leaves_chat_member_mention_plain_text_on_lookup_failure(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_plain"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    if request.uri == "/open-apis/directory/v1/employees/search":
+                        raise AssertionError("employee search must not be used for outbound mentions")
+                    return SimpleNamespace(raw=SimpleNamespace(content=json.dumps({"code": 999, "msg": "no permission"}).encode("utf-8")))
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["request"].request_body.msg_type, "text")
+            self.assertEqual(
+                captured["request"].request_body.content,
+                json.dumps({"text": "请 @白芒 看一下"}, ensure_ascii=False),
+            )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_does_not_use_removed_department_fallback_when_configured(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(
+            PlatformConfig(
+                extra={
+                    "mention_contact_lookup_fallback": True,
+                    "outbound_mention_lookup_chat_members": False,
+                    "mention_contact_lookup_max_pages": 1,
+                }
+            )
+        )
+        captured = {"uris": []}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_fallback"))
+
+        class _Client:
+            im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+            def request(self, request):
+                captured["uris"].append(request.uri)
+                raise AssertionError(f"unexpected lookup request: {request.uri}")
+
+        adapter._client = _Client()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @Fallback 看一下"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["uris"], [])
+        self.assertEqual(captured["request"].request_body.msg_type, "text")
+        self.assertEqual(
+            captured["request"].request_body.content,
+            json.dumps({"text": "请 @Fallback 看一下"}, ensure_ascii=False),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_leaves_unknown_visible_chat_member_mention_as_plain_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_plain"))
+
+        class _Client:
+            im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+            def request(self, request):
+                if request.uri == "/open-apis/directory/v1/employees/search":
+                    raise AssertionError("employee search must not be used for outbound mentions")
+                if request.uri == "/open-apis/im/v1/chats":
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(content=json.dumps({"code": 0, "data": {"items": [{"chat_id": "oc_visible"}], "has_more": False}}).encode("utf-8"))
+                    )
+                return SimpleNamespace(raw=SimpleNamespace(content=json.dumps({"code": 0, "data": {"items": [], "has_more": False}}).encode("utf-8")))
+
+        adapter._client = _Client()
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @Unknown 看一下"))
+
+        self.assertTrue(result.success)
+        self.assertEqual(captured["request"].request_body.msg_type, "text")
+        self.assertEqual(
+            captured["request"].request_body.content,
+            json.dumps({"text": "请 @Unknown 看一下"}, ensure_ascii=False),
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_uses_visible_chat_member_directly_for_unknown_at_name(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {"uris": []}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_chat_member"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    captured["uris"].append(request.uri)
+                    if request.uri == "/open-apis/directory/v1/employees/search":
+                        raise AssertionError("employee search must not be used for outbound mentions")
+                    if request.uri == "/open-apis/im/v1/chats":
+                        return SimpleNamespace(
+                            raw=SimpleNamespace(
+                                content=json.dumps(
+                                    {"code": 0, "data": {"items": [{"chat_id": "oc_visible"}], "has_more": False}},
+                                    ensure_ascii=False,
+                                ).encode("utf-8")
+                            )
+                    )
+                    if request.uri != "/open-apis/im/v1/chats/oc_visible/members":
+                        raise AssertionError(request.uri)
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "code": 0,
+                                    "data": {
+                                        "items": [
+                                            {"member_id": "ou_baimang_bot", "member_id_type": "open_id", "name": "白芒"},
+                                        ],
+                                        "has_more": False,
+                                    },
+                                },
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(
+                captured["uris"],
+                [
+                    "/open-apis/im/v1/chats",
+                    "/open-apis/im/v1/chats/oc_visible/members",
+                ],
+            )
+            self.assertEqual(captured["request"].request_body.msg_type, "post")
+            content = json.loads(captured["request"].request_body.content)["zh_cn"]["content"]
+            self.assertEqual(content[0][1], {"tag": "at", "user_id": "ou_baimang_bot"})
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_leaves_duplicate_visible_chat_member_name_as_plain_text(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {"member_calls": 0}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_duplicate_member"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    if request.uri == "/open-apis/directory/v1/employees/search":
+                        raise AssertionError("employee search must not be used for outbound mentions")
+                    if request.uri == "/open-apis/im/v1/chats":
+                        return SimpleNamespace(
+                            raw=SimpleNamespace(
+                                content=json.dumps(
+                                    {
+                                        "code": 0,
+                                        "data": {
+                                            "items": [{"chat_id": "oc_one"}, {"chat_id": "oc_two"}],
+                                            "has_more": False,
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                ).encode("utf-8")
+                            )
+                        )
+                    captured["member_calls"] += 1
+                    member_id = "ou_baimang_one" if request.uri.endswith("/oc_one/members") else "ou_baimang_two"
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(
+                            content=json.dumps(
+                                {"code": 0, "data": {"items": [{"member_id": member_id, "name": "白芒"}], "has_more": False}},
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["member_calls"], 2)
+            self.assertEqual(captured["request"].request_body.msg_type, "text")
+            self.assertEqual(
+                captured["request"].request_body.content,
+                json.dumps({"text": "请 @白芒 看一下"}, ensure_ascii=False),
+            )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_leaves_chat_member_lookup_plain_text_on_api_failure(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {"uris": []}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_member_failure"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    captured["uris"].append(request.uri)
+                    if request.uri == "/open-apis/directory/v1/employees/search":
+                        raise AssertionError("employee search must not be used for outbound mentions")
+                    return SimpleNamespace(raw=SimpleNamespace(content=json.dumps({"code": 999, "msg": "chat list denied"}).encode("utf-8")))
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["uris"], ["/open-apis/im/v1/chats"])
+            self.assertEqual(captured["request"].request_body.msg_type, "text")
+            self.assertEqual(
+                captured["request"].request_body.content,
+                json.dumps({"text": "请 @白芒 看一下"}, ensure_ascii=False),
+            )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_can_disable_visible_chat_member_lookup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_lookup_chat_members": False}))
+            captured = {"uris": []}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_member_disabled"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    captured["uris"].append(request.uri)
+                    return SimpleNamespace(raw=SimpleNamespace(content=json.dumps({"code": 0, "data": {"employees": []}}).encode("utf-8")))
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["uris"], [])
+            self.assertEqual(captured["request"].request_body.msg_type, "text")
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_outbound_mention_lookup_enabled_prefers_clean_name_and_keeps_old_aliases(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        self.assertTrue(adapter._outbound_mention_lookup_enabled)
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_lookup_enabled": False}))
+        self.assertFalse(adapter._outbound_mention_lookup_enabled)
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_lookup": True}))
+        self.assertTrue(adapter._outbound_mention_lookup_enabled)
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_directory_enabled": False}))
+        self.assertFalse(adapter._outbound_mention_lookup_enabled)
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"outbound_mention_directory_enabled": True}))
+        self.assertTrue(adapter._outbound_mention_lookup_enabled)
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"mention_contact_lookup": False}))
+        self.assertFalse(adapter._outbound_mention_lookup_enabled)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_without_at_token_does_not_call_outbound_mention_lookup(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _MessageAPI:
+            def create(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_plain"))
+
+        adapter._client = SimpleNamespace(im=SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI())), request=Mock())
+
+        async def _direct(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+            result = asyncio.run(adapter.send(chat_id="oc_chat", content="no mentions here"))
+
+        self.assertTrue(result.success)
+        adapter._client.request.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_logs_outbound_mention_lookup_hit_payload_and_message_id(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {"uris": []}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_logged_mention"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    captured["uris"].append(request.uri)
+                    if request.uri == "/open-apis/im/v1/chats":
+                        return SimpleNamespace(
+                            raw=SimpleNamespace(
+                                content=json.dumps(
+                                    {"code": 0, "data": {"items": [{"chat_id": "oc_visible"}], "has_more": False}},
+                                    ensure_ascii=False,
+                                ).encode("utf-8")
+                            )
+                        )
+                    if request.uri != "/open-apis/im/v1/chats/oc_visible/members":
+                        raise AssertionError(request.uri)
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(
+                            content=json.dumps(
+                                {
+                                    "code": 0,
+                                    "data": {
+                                        "items": [{"member_id": "ou_baimang", "member_id_type": "open_id", "name": "白芒"}],
+                                        "has_more": False,
+                                    },
+                                },
+                                ensure_ascii=False,
+                            ).encode("utf-8")
+                        )
+                    )
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                with self.assertLogs("gateway.platforms.feishu", level="INFO") as logs:
+                    result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertIn("om_logged_mention", "\n".join(logs.output))
+            self.assertIn("resolved outbound mention token='@白芒'", "\n".join(logs.output))
+            self.assertIn("msg_type=post", "\n".join(logs.output))
+            self.assertIn("mention_count=1", "\n".join(logs.output))
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_send_logs_outbound_mention_lookup_miss_before_plain_text_fallback(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        with _isolated_hermes_home():
+            adapter = FeishuAdapter(PlatformConfig())
+            captured = {}
+
+            class _MessageAPI:
+                def create(self, request):
+                    captured["request"] = request
+                    return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="om_logged_miss"))
+
+            class _Client:
+                im = SimpleNamespace(v1=SimpleNamespace(message=_MessageAPI()))
+
+                def request(self, request):
+                    if request.uri == "/open-apis/im/v1/chats":
+                        return SimpleNamespace(
+                            raw=SimpleNamespace(
+                                content=json.dumps(
+                                    {"code": 0, "data": {"items": [{"chat_id": "oc_visible"}], "has_more": False}},
+                                    ensure_ascii=False,
+                                ).encode("utf-8")
+                            )
+                        )
+                    if request.uri != "/open-apis/im/v1/chats/oc_visible/members":
+                        raise AssertionError(request.uri)
+                    return SimpleNamespace(
+                        raw=SimpleNamespace(
+                            content=json.dumps({"code": 0, "data": {"items": [], "has_more": False}}, ensure_ascii=False).encode("utf-8")
+                        )
+                    )
+
+            adapter._client = _Client()
+
+            async def _direct(func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+            with patch("gateway.platforms.feishu.asyncio.to_thread", side_effect=_direct):
+                with self.assertLogs("gateway.platforms.feishu", level="INFO") as logs:
+                    result = asyncio.run(adapter.send(chat_id="oc_chat", content="请 @白芒 看一下"))
+
+            self.assertTrue(result.success)
+            self.assertEqual(captured["request"].request_body.msg_type, "text")
+            log_text = "\n".join(logs.output)
+            self.assertIn("outbound mention lookup miss token='@白芒'", log_text)
+            self.assertIn("sending outbound mention-looking text without resolved Feishu at elements", log_text)
+            self.assertIn("msg_type=text", log_text)
 
     @patch.dict(os.environ, {}, clear=True)
     def test_process_message_background_preserves_feishu_mentions_in_response_metadata(self):

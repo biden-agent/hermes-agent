@@ -71,7 +71,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 
 try:
@@ -208,6 +208,13 @@ _TEXT_BATCH_INFLIGHT_POLL_SECONDS = 0.05
 _TEXT_BATCH_INFLIGHT_MAX_WAIT_SECONDS = 5.0
 _DEFAULT_MEDIA_BATCH_DELAY_SECONDS = 0.8
 _DEFAULT_DEDUP_CACHE_SIZE = 2048
+_DEFAULT_FEISHU_OUTBOUND_MENTION_CACHE_TTL_SECONDS = 10 * 60
+_DEFAULT_FEISHU_OUTBOUND_MENTION_CHAT_PAGE_SIZE = 50
+_FEISHU_OUTBOUND_MENTION_CHAT_MAX_PAGE_SIZE = 100
+_DEFAULT_FEISHU_OUTBOUND_MENTION_CHAT_MAX_PAGES = 10
+_DEFAULT_FEISHU_OUTBOUND_MENTION_MEMBER_PAGE_SIZE = 50
+_FEISHU_OUTBOUND_MENTION_MEMBER_MAX_PAGE_SIZE = 100
+_DEFAULT_FEISHU_OUTBOUND_MENTION_MEMBER_MAX_PAGES_PER_CHAT = 5
 _FEISHU_GROUP_HISTORY_SIZE = 100
 _DEFAULT_FEISHU_GROUP_HISTORY_INJECT_COUNT = 5
 _GROUP_HISTORY_METADATA_ROLE = "_hermes_group_history_role"
@@ -301,6 +308,7 @@ _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 _MENTION_BOUNDARY_CHARS = frozenset(" \t\n\r.,;:!?、，。；：！？()[]{}<>\"'`")
 _TRAILING_TERMINAL_PUNCT = frozenset(" \t\n\r.!?。！？")
 _WHITESPACE_RE = re.compile(r"\s+")
+_OUTBOUND_AT_TOKEN_RE = re.compile(r"@([^@\s]+)")
 _SUPPORTED_CARD_TEXT_KEYS = (
     "title",
     "text",
@@ -423,7 +431,13 @@ class FeishuAdapterSettings:
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
-    require_mention: bool = True
+    outbound_mention_lookup_enabled: bool = True
+    outbound_mention_lookup_chat_members_enabled: bool = True
+    outbound_mention_cache_ttl_seconds: int = _DEFAULT_FEISHU_OUTBOUND_MENTION_CACHE_TTL_SECONDS
+    outbound_mention_chat_page_size: int = _DEFAULT_FEISHU_OUTBOUND_MENTION_CHAT_PAGE_SIZE
+    outbound_mention_chat_max_pages: int = _DEFAULT_FEISHU_OUTBOUND_MENTION_CHAT_MAX_PAGES
+    outbound_mention_member_page_size: int = _DEFAULT_FEISHU_OUTBOUND_MENTION_MEMBER_PAGE_SIZE
+    outbound_mention_member_max_pages_per_chat: int = _DEFAULT_FEISHU_OUTBOUND_MENTION_MEMBER_MAX_PAGES_PER_CHAT
 
 
 @dataclass
@@ -584,6 +598,30 @@ def _coerce_int(value: Any, default: Optional[int] = None, min_value: int = 0) -
 def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
     parsed = _coerce_int(value, default=default, min_value=min_value)
     return default if parsed is None else parsed
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+def _coerce_config_bool(extra: Dict[str, Any], names: Sequence[str], default: bool) -> bool:
+    for name in names:
+        parsed = _coerce_optional_bool(extra.get(name))
+        if parsed is not None:
+            return parsed
+    return default
 
 
 # ---------------------------------------------------------------------------
@@ -1578,6 +1616,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+        self._outbound_mention_lookup_cache: Dict[str, tuple[Optional[FeishuMentionRef], float]] = {}
+        self._mention_refs_path = get_hermes_home() / "feishu_mention_refs.json"
+        self._mention_refs_lock = threading.Lock()
+        self._mention_refs_by_name: Dict[str, FeishuMentionRef] = {}
+        self._mention_refs_ambiguous_names: set[str] = set()
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
@@ -1613,6 +1656,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
+        self._load_persisted_mention_refs()
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -1729,6 +1773,61 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=default_group_policy,
             group_rules=group_rules,
             allow_bots=allow_bots,
+            outbound_mention_lookup_enabled=_coerce_config_bool(
+                extra,
+                (
+                    "outbound_mention_lookup",
+                    "outbound_mention_lookup_enabled",
+                    "mention_contact_lookup",
+                    "mention_contact_lookup_enabled",
+                    "outbound_mention_directory_enabled",
+                ),
+                True,
+            ),
+            outbound_mention_lookup_chat_members_enabled=_coerce_config_bool(
+                extra,
+                (
+                    "outbound_mention_lookup_chat_members",
+                    "outbound_mention_lookup_chat_members_enabled",
+                    "mention_contact_lookup_chat_members",
+                    "mention_contact_lookup_chat_members_enabled",
+                ),
+                True,
+            ),
+            outbound_mention_cache_ttl_seconds=_coerce_required_int(
+                extra.get("outbound_mention_cache_ttl_seconds")
+                or extra.get("mention_contact_lookup_cache_ttl_seconds"),
+                default=_DEFAULT_FEISHU_OUTBOUND_MENTION_CACHE_TTL_SECONDS,
+                min_value=1,
+            ),
+            outbound_mention_chat_page_size=min(
+                _coerce_required_int(
+                    extra.get("outbound_mention_chat_page_size") or extra.get("mention_contact_lookup_chat_page_size"),
+                    default=_DEFAULT_FEISHU_OUTBOUND_MENTION_CHAT_PAGE_SIZE,
+                    min_value=1,
+                ),
+                _FEISHU_OUTBOUND_MENTION_CHAT_MAX_PAGE_SIZE,
+            ),
+            outbound_mention_chat_max_pages=_coerce_required_int(
+                extra.get("outbound_mention_chat_max_pages") or extra.get("mention_contact_lookup_chat_max_pages"),
+                default=_DEFAULT_FEISHU_OUTBOUND_MENTION_CHAT_MAX_PAGES,
+                min_value=1,
+            ),
+            outbound_mention_member_page_size=min(
+                _coerce_required_int(
+                    extra.get("outbound_mention_member_page_size")
+                    or extra.get("mention_contact_lookup_member_page_size"),
+                    default=_DEFAULT_FEISHU_OUTBOUND_MENTION_MEMBER_PAGE_SIZE,
+                    min_value=1,
+                ),
+                _FEISHU_OUTBOUND_MENTION_MEMBER_MAX_PAGE_SIZE,
+            ),
+            outbound_mention_member_max_pages_per_chat=_coerce_required_int(
+                extra.get("outbound_mention_member_max_pages_per_chat")
+                or extra.get("mention_contact_lookup_member_max_pages_per_chat"),
+                default=_DEFAULT_FEISHU_OUTBOUND_MENTION_MEMBER_MAX_PAGES_PER_CHAT,
+                min_value=1,
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1763,6 +1862,13 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._outbound_mention_lookup_enabled = settings.outbound_mention_lookup_enabled
+        self._outbound_mention_lookup_chat_members_enabled = settings.outbound_mention_lookup_chat_members_enabled
+        self._outbound_mention_cache_ttl_seconds = settings.outbound_mention_cache_ttl_seconds
+        self._outbound_mention_chat_page_size = settings.outbound_mention_chat_page_size
+        self._outbound_mention_chat_max_pages = settings.outbound_mention_chat_max_pages
+        self._outbound_mention_member_page_size = settings.outbound_mention_member_page_size
+        self._outbound_mention_member_max_pages_per_chat = settings.outbound_mention_member_max_pages_per_chat
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -1936,7 +2042,40 @@ class FeishuAdapter(BasePlatformAdapter):
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk, metadata=metadata)
+                mention_refs = await self._resolve_outbound_mention_refs(chunk, metadata=metadata)
+                msg_type, payload = self._build_outbound_payload(
+                    chunk,
+                    metadata=metadata,
+                    mention_refs=mention_refs,
+                )
+                if (
+                    msg_type == "text"
+                    and mention_refs
+                    and "@" in chunk
+                ):
+                    logger.info(
+                        "[Feishu] sending outbound mention-looking text without resolved Feishu at elements "
+                        "chat_id=%s msg_type=%s mention_count=%d content_len=%d",
+                        chat_id,
+                        msg_type,
+                        len(mention_refs),
+                        len(chunk or ""),
+                    )
+                elif msg_type == "text" and "@" in chunk:
+                    logger.info(
+                        "[Feishu] sending outbound mention-looking text without resolved Feishu at elements "
+                        "chat_id=%s msg_type=%s mention_count=0 content_len=%d",
+                        chat_id,
+                        msg_type,
+                        len(chunk or ""),
+                    )
+                logger.info(
+                    "[Feishu] outbound send prepared chat_id=%s msg_type=%s mention_count=%d content_len=%d",
+                    chat_id,
+                    msg_type,
+                    len(mention_refs),
+                    len(chunk or ""),
+                )
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id,
@@ -1970,6 +2109,15 @@ class FeishuAdapter(BasePlatformAdapter):
                         metadata=metadata,
                     )
                 last_response = response
+                result = self._finalize_send_result(response, "send failed")
+                if result.success:
+                    logger.info(
+                        "[Feishu] outbound send completed chat_id=%s msg_type=%s mention_count=%d message_id=%s",
+                        chat_id,
+                        msg_type,
+                        len(mention_refs),
+                        result.message_id or "",
+                    )
 
             result = self._finalize_send_result(last_response, "send failed")
             if result.success and self._should_cache_outbound_group_history(metadata):
@@ -4051,6 +4199,7 @@ class FeishuAdapter(BasePlatformAdapter):
             mentions=getattr(message, "mentions", None),
             bot=self._bot_identity(),
         )
+        self._remember_inbound_mention_refs(normalized.mentions)
         media_urls, media_types = await self._download_feishu_message_resources(
             message_id=message_id,
             normalized=normalized,
@@ -4843,18 +4992,351 @@ class FeishuAdapter(BasePlatformAdapter):
             self._persist_seen_message_ids()
             return False
 
+    def _load_persisted_mention_refs(self) -> None:
+        if not hasattr(self, "_mention_refs_path"):
+            self._mention_refs_path = get_hermes_home() / "feishu_mention_refs.json"
+        if not hasattr(self, "_mention_refs_lock"):
+            self._mention_refs_lock = threading.Lock()
+        if not hasattr(self, "_mention_refs_by_name"):
+            self._mention_refs_by_name = {}
+        if not hasattr(self, "_mention_refs_ambiguous_names"):
+            self._mention_refs_ambiguous_names = set()
+        try:
+            raw = json.loads(self._mention_refs_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            logger.warning("[Feishu] Ignoring unreadable mention refs cache at %s", self._mention_refs_path, exc_info=True)
+            return
+        raw_mentions = raw.get("mentions") if isinstance(raw, dict) else None
+        if not isinstance(raw_mentions, dict):
+            return
+        raw_ambiguous = raw.get("ambiguous") if isinstance(raw, dict) else None
+        ambiguous_names: set[str] = set()
+        if isinstance(raw_ambiguous, list):
+            ambiguous_names = {str(name).strip() for name in raw_ambiguous if str(name).strip()}
+        elif isinstance(raw_ambiguous, dict):
+            ambiguous_names = {str(name).strip() for name, value in raw_ambiguous.items() if value and str(name).strip()}
+        loaded: Dict[str, FeishuMentionRef] = {}
+        for name, item in raw_mentions.items():
+            if not isinstance(item, dict):
+                continue
+            ref_name = str(item.get("name") or name or "").strip()
+            open_id = str(item.get("open_id") or "").strip()
+            if not ref_name or not open_id or ref_name in ambiguous_names:
+                continue
+            loaded[ref_name] = FeishuMentionRef(name=ref_name, open_id=open_id)
+        with self._mention_refs_lock:
+            self._mention_refs_by_name = loaded
+            self._mention_refs_ambiguous_names = ambiguous_names
+
+    def _ensure_mention_refs_state(self) -> None:
+        if not hasattr(self, "_mention_refs_path"):
+            self._mention_refs_path = get_hermes_home() / "feishu_mention_refs.json"
+        if not hasattr(self, "_mention_refs_lock"):
+            self._mention_refs_lock = threading.Lock()
+        if not hasattr(self, "_mention_refs_by_name"):
+            self._mention_refs_by_name = {}
+            self._load_persisted_mention_refs()
+        if not hasattr(self, "_mention_refs_ambiguous_names"):
+            self._mention_refs_ambiguous_names = set()
+
+    def _ensure_outbound_mention_lookup_state(self) -> None:
+        if not hasattr(self, "_outbound_mention_lookup_cache"):
+            self._outbound_mention_lookup_cache = {}
+        if not hasattr(self, "_outbound_mention_cache_ttl_seconds"):
+            self._outbound_mention_cache_ttl_seconds = _DEFAULT_FEISHU_OUTBOUND_MENTION_CACHE_TTL_SECONDS
+        if not hasattr(self, "_outbound_mention_lookup_chat_members_enabled"):
+            self._outbound_mention_lookup_chat_members_enabled = True
+
+    def _persist_mention_refs(self) -> None:
+        self._ensure_mention_refs_state()
+        with self._mention_refs_lock:
+            mentions = {
+                name: {"name": ref.name, "open_id": ref.open_id}
+                for name, ref in sorted(self._mention_refs_by_name.items())
+                if ref.name and ref.open_id
+            }
+            ambiguous_names = sorted(self._mention_refs_ambiguous_names)
+        try:
+            payload: Dict[str, Any] = {"mentions": mentions}
+            if ambiguous_names:
+                payload["ambiguous"] = ambiguous_names
+            atomic_json_write(self._mention_refs_path, payload)
+        except OSError:
+            logger.warning("[Feishu] Failed to persist mention refs to %s", self._mention_refs_path, exc_info=True)
+
+    def _remember_inbound_mention_refs(self, mentions: Sequence[FeishuMentionRef]) -> None:
+        self._ensure_mention_refs_state()
+        changed = False
+        with self._mention_refs_lock:
+            for ref in mentions:
+                if ref.is_all or ref.is_self or not ref.name or not ref.open_id:
+                    continue
+                if ref.name in self._mention_refs_ambiguous_names:
+                    continue
+                existing = self._mention_refs_by_name.get(ref.name)
+                if existing and existing.open_id == ref.open_id:
+                    continue
+                if existing and existing.open_id != ref.open_id:
+                    self._mention_refs_by_name.pop(ref.name, None)
+                    self._mention_refs_ambiguous_names.add(ref.name)
+                    changed = True
+                    continue
+                self._mention_refs_by_name[ref.name] = FeishuMentionRef(name=ref.name, open_id=ref.open_id)
+                changed = True
+        if changed:
+            self._persist_mention_refs()
+
+    def _persisted_mention_ref(self, query: str) -> Optional[FeishuMentionRef]:
+        self._ensure_mention_refs_state()
+        query = (query or "").strip()
+        if not query:
+            return None
+        with self._mention_refs_lock:
+            if query in self._mention_refs_ambiguous_names:
+                return None
+            ref = self._mention_refs_by_name.get(query)
+            if ref is not None:
+                return ref
+            normalized = query.casefold()
+            if any(name.casefold() == normalized for name in self._mention_refs_ambiguous_names):
+                return None
+            for candidate in self._mention_refs_by_name.values():
+                if candidate.name.casefold() == normalized:
+                    return candidate
+        return None
+
     # =========================================================================
     # Outbound payload construction and send pipeline
     # =========================================================================
 
-    def _build_outbound_payload(self, content: str, metadata: Optional[Dict[str, Any]] = None) -> tuple[str, str]:
+    async def _resolve_outbound_mention_refs(
+        self,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> List[FeishuMentionRef]:
+        refs = _outbound_mention_refs(metadata)
+        if "@" not in content or not self._outbound_mention_lookup_enabled:
+            return refs
+
+        known_tokens = {f"@{ref.name}" for ref in refs}
+        seen = {(ref.name, ref.open_id) for ref in refs}
+        for token in self._extract_outbound_mention_tokens(content):
+            if token in known_tokens:
+                continue
+            ref = await self._resolve_outbound_mention_ref(token[1:])
+            if ref is None:
+                logger.info(
+                    "[Feishu] outbound mention lookup miss token=%r query=%r",
+                    token,
+                    token[1:],
+                )
+                continue
+            logger.info(
+                "[Feishu] resolved outbound mention token=%r query=%r open_id=%s",
+                token,
+                token[1:],
+                ref.open_id,
+            )
+            key = (ref.name, ref.open_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(ref)
+        refs.sort(key=lambda ref: len(ref.name), reverse=True)
+        return refs
+
+    @staticmethod
+    def _extract_outbound_mention_tokens(content: str) -> List[str]:
+        tokens: List[str] = []
+        seen: set[str] = set()
+        for match in _OUTBOUND_AT_TOKEN_RE.finditer(content or ""):
+            name = match.group(1).strip().rstrip(".,;:!?、，。；：！？)]}>")
+            if not name:
+                continue
+            token = f"@{name}"
+            if token in seen:
+                continue
+            seen.add(token)
+            tokens.append(token)
+        return tokens
+
+    async def _resolve_outbound_mention_ref(self, query: str) -> Optional[FeishuMentionRef]:
+        self._ensure_outbound_mention_lookup_state()
+        now = time.time()
+        cached = self._outbound_mention_lookup_cache.get(query)
+        if cached is not None:
+            ref, expire_at = cached
+            if now < expire_at:
+                return ref
+
+        ref = self._persisted_mention_ref(query)
+        if ref is not None:
+            self._outbound_mention_lookup_cache[query] = (
+                ref,
+                now + self._outbound_mention_cache_ttl_seconds,
+            )
+            return ref
+
+        ref: Optional[FeishuMentionRef] = None
+        if self._outbound_mention_lookup_chat_members_enabled:
+            try:
+                ref = await self._search_visible_chat_member_mention(query)
+            except Exception:
+                logger.debug("[Feishu] Failed to resolve outbound mention from visible chat members", exc_info=True)
+
+        self._outbound_mention_lookup_cache[query] = (
+            ref,
+            now + self._outbound_mention_cache_ttl_seconds,
+        )
+        return ref
+
+    async def _search_visible_chat_member_mention(self, query: str) -> Optional[FeishuMentionRef]:
+        if not self._client or not query:
+            return None
+        normalized_query = query.strip().casefold()
+        matches: Dict[str, str] = {}
+        for chat_id in await self._fetch_visible_chat_ids_for_mention_lookup():
+            for member in await self._fetch_visible_chat_members_for_mention_lookup(chat_id):
+                member_id = self._chat_member_id(member)
+                if not member_id:
+                    continue
+                name = self._chat_member_name(member)
+                if name.casefold() != normalized_query:
+                    continue
+                matches[member_id] = name
+        if len(matches) != 1:
+            return None
+        member_id = next(iter(matches))
+        return FeishuMentionRef(name=query, open_id=member_id)
+
+    async def _fetch_visible_chat_ids_for_mention_lookup(self) -> List[str]:
+        if not self._client:
+            return []
+        chat_ids: List[str] = []
+        page_token = ""
+        for _ in range(self._outbound_mention_chat_max_pages):
+            queries = [
+                ("user_id_type", "open_id"),
+                ("page_size", str(self._outbound_mention_chat_page_size)),
+            ]
+            if page_token:
+                queries.append(("page_token", page_token))
+            req = (
+                BaseRequest.builder()
+                .http_method(HttpMethod.GET)
+                .uri("/open-apis/im/v1/chats")
+                .queries(queries)
+                .token_types({AccessTokenType.TENANT})
+                .build()
+            )
+            resp = await asyncio.to_thread(self._client.request, req)
+            payload = self._parse_raw_json_response(resp)
+            if payload.get("code") not in (0, None):
+                raise RuntimeError(str(payload.get("msg") or "visible chat lookup failed"))
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            items = data.get("items") or data.get("chats") or []
+            if isinstance(items, list):
+                for item in items:
+                    chat_id = self._chat_id_from_visible_chat(item)
+                    if chat_id:
+                        chat_ids.append(chat_id)
+            if not data.get("has_more"):
+                break
+            page_token = str(data.get("page_token") or "").strip()
+            if not page_token:
+                break
+        return chat_ids
+
+    async def _fetch_visible_chat_members_for_mention_lookup(self, chat_id: str) -> List[Any]:
+        if not self._client or not chat_id:
+            return []
+        members: List[Any] = []
+        page_token = ""
+        escaped_chat_id = quote(str(chat_id), safe="")
+        for _ in range(self._outbound_mention_member_max_pages_per_chat):
+            queries = [
+                ("member_id_type", "open_id"),
+                ("page_size", str(self._outbound_mention_member_page_size)),
+            ]
+            if page_token:
+                queries.append(("page_token", page_token))
+            req = (
+                BaseRequest.builder()
+                .http_method(HttpMethod.GET)
+                .uri(f"/open-apis/im/v1/chats/{escaped_chat_id}/members")
+                .queries(queries)
+                .token_types({AccessTokenType.TENANT})
+                .build()
+            )
+            resp = await asyncio.to_thread(self._client.request, req)
+            payload = self._parse_raw_json_response(resp)
+            if payload.get("code") not in (0, None):
+                raise RuntimeError(str(payload.get("msg") or "visible chat member lookup failed"))
+            data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+            items = data.get("items") or data.get("members") or []
+            if isinstance(items, list):
+                members.extend(items)
+            if not data.get("has_more"):
+                break
+            page_token = str(data.get("page_token") or "").strip()
+            if not page_token:
+                break
+        return members
+
+    @staticmethod
+    def _chat_id_from_visible_chat(chat: Any) -> str:
+        if isinstance(chat, dict):
+            value = chat.get("chat_id") or chat.get("chat_id_v2")
+        else:
+            value = getattr(chat, "chat_id", None) or getattr(chat, "chat_id_v2", None)
+        return str(value or "").strip()
+
+    @staticmethod
+    def _chat_member_id(member: Any) -> str:
+        if isinstance(member, dict):
+            member_id_type = str(member.get("member_id_type") or "").strip()
+            value = member.get("member_id")
+        else:
+            member_id_type = str(getattr(member, "member_id_type", "") or "").strip()
+            value = getattr(member, "member_id", None)
+        if member_id_type and member_id_type != "open_id":
+            return ""
+        return str(value or "").strip()
+
+    @staticmethod
+    def _chat_member_name(member: Any) -> str:
+        if isinstance(member, dict):
+            value = member.get("name")
+        else:
+            value = getattr(member, "name", None)
+        return str(value or "").strip()
+
+    @staticmethod
+    def _parse_raw_json_response(response: Any) -> Dict[str, Any]:
+        content = getattr(getattr(response, "raw", None), "content", None)
+        if not content:
+            return {}
+        if isinstance(content, bytes):
+            content = content.decode("utf-8")
+        parsed = json.loads(content)
+        return parsed if isinstance(parsed, dict) else {}
+
+    def _build_outbound_payload(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+        mention_refs: Optional[Sequence[FeishuMentionRef]] = None,
+    ) -> tuple[str, str]:
         # Feishu post-type 'md' elements do not render markdown tables; sending
         # table content as post causes the message to appear blank on the client.
         # Force plain text for anything that looks like a markdown table.
         if _MARKDOWN_TABLE_RE.search(content):
             text_payload = {"text": content}
             return "text", json.dumps(text_payload, ensure_ascii=False)
-        mention_refs = _outbound_mention_refs(metadata)
+        mention_refs = list(mention_refs) if mention_refs is not None else _outbound_mention_refs(metadata)
         has_known_mention = any(f"@{ref.name}" in content for ref in mention_refs)
         if _MARKDOWN_HINT_RE.search(content):
             if has_known_mention:
