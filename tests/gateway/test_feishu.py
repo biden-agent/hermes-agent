@@ -270,6 +270,222 @@ class TestFeishuMessageNormalization(unittest.TestCase):
         )
 
 
+class TestFeishuMessageIdentityLogging(unittest.TestCase):
+    def test_identity_log_fields_support_namespaces_and_dicts(self):
+        from gateway.platforms.feishu import _feishu_message_identity_fields
+
+        namespace_message = SimpleNamespace(
+            message_id="om_ns",
+            chat_id="oc_ns",
+            chat_type="group",
+            message_type="text",
+            thread_id="omt_ns",
+            root_id="om_root_ns",
+            parent_id="om_parent_ns",
+            upper_message_id="om_upper_ns",
+        )
+        dict_message = {
+            "message_id": "om_dict",
+            "chat_id": "oc_dict",
+            "chat_type": "p2p",
+            "message_type": "post",
+            "thread_id": "omt_dict",
+            "root_id": "om_root_dict",
+            "parent_id": "om_parent_dict",
+            "upper_message_id": "om_upper_dict",
+        }
+
+        self.assertEqual(
+            _feishu_message_identity_fields(namespace_message, source_thread_id="omt_canonical_ns"),
+            {
+                "message_id": "om_ns",
+                "chat_id": "oc_ns",
+                "chat_type": "group",
+                "message_type": "text",
+                "thread_id": "omt_ns",
+                "root_id": "om_root_ns",
+                "parent_id": "om_parent_ns",
+                "upper_message_id": "om_upper_ns",
+                "source_thread_id": "omt_canonical_ns",
+            },
+        )
+        self.assertEqual(
+            _feishu_message_identity_fields(dict_message, source_thread_id="omt_canonical_dict"),
+            {
+                "message_id": "om_dict",
+                "chat_id": "oc_dict",
+                "chat_type": "p2p",
+                "message_type": "post",
+                "thread_id": "omt_dict",
+                "root_id": "om_root_dict",
+                "parent_id": "om_parent_dict",
+                "upper_message_id": "om_upper_dict",
+                "source_thread_id": "omt_canonical_dict",
+            },
+        )
+
+    def test_inbound_processing_logs_identity_fields_without_message_content(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._extract_message_content = AsyncMock(
+            return_value=("secret incident content", MessageType.TEXT, [], [], [])
+        )
+        adapter.get_chat_info = AsyncMock(
+            return_value={"chat_id": "oc_group", "name": "Platform Team", "type": "group"}
+        )
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "u_alice", "user_name": "Alice", "user_id_alt": "on_alice"}
+        )
+        adapter._dispatch_inbound_event = AsyncMock()
+
+        message = SimpleNamespace(
+            message_id="om_msg",
+            chat_id="oc_group",
+            chat_type="group",
+            message_type="text",
+            thread_id="omt_thread",
+            root_id="om_root",
+            parent_id="om_parent",
+            upper_message_id="om_upper",
+        )
+        sender_id = SimpleNamespace(open_id="ou_alice", user_id="u_alice", union_id="on_alice")
+        data = SimpleNamespace(event=SimpleNamespace(message=message))
+
+        with self.assertLogs("gateway.platforms.feishu", level="INFO") as logs:
+            asyncio.run(
+                adapter._process_inbound_message(
+                    data=data,
+                    message=message,
+                    sender_id=sender_id,
+                    chat_type="group",
+                    message_id="om_msg",
+                )
+            )
+
+        identity_logs = [line for line in logs.output if "Feishu inbound message identity" in line]
+        self.assertEqual(len(identity_logs), 1)
+        identity_log = identity_logs[0]
+        self.assertIn("message_id=om_msg", identity_log)
+        self.assertIn("chat_id=oc_group", identity_log)
+        self.assertIn("chat_type=group", identity_log)
+        self.assertIn("message_type=text", identity_log)
+        self.assertIn("thread_id=omt_thread", identity_log)
+        self.assertIn("root_id=om_root", identity_log)
+        self.assertIn("parent_id=om_parent", identity_log)
+        self.assertIn("upper_message_id=om_upper", identity_log)
+        self.assertIn("source_thread_id=omt_thread", identity_log)
+        self.assertNotIn("secret incident content", identity_log)
+
+    def test_inbound_root_message_id_does_not_become_thread_identity(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import build_session_key
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._extract_message_content = AsyncMock(return_value=("reply", MessageType.TEXT, [], [], []))
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_group", "name": "Platform Team", "type": "group"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "u_alice", "user_name": "Alice", "user_id_alt": "on_alice"}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="root context")
+        adapter._dispatch_inbound_event = AsyncMock()
+
+        message = SimpleNamespace(
+            message_id="om_reply",
+            chat_id="oc_group",
+            chat_type="group",
+            message_type="text",
+            content=json.dumps({"text": "reply"}),
+            thread_id=None,
+            root_id="om_root_message",
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(open_id="ou_alice", user_id="u_alice", union_id="on_alice")
+        data = SimpleNamespace(event=SimpleNamespace(message=message))
+
+        raw_key = adapter._raw_text_batch_key(message, sender_id, "group")
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=sender_id,
+                chat_type="group",
+                message_id="om_reply",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertIsNone(event.source.thread_id)
+        self.assertEqual(event.reply_to_message_id, "om_root_message")
+        self.assertEqual(event.reply_to_text, "root context")
+        self.assertEqual(
+            raw_key,
+            build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+            ),
+        )
+
+    def test_inbound_topic_root_id_is_canonical_thread_identity_when_thread_id_missing(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.base import MessageType
+        from gateway.platforms.feishu import FeishuAdapter
+        from gateway.session import build_session_key
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._extract_message_content = AsyncMock(return_value=("topic reply", MessageType.TEXT, [], [], []))
+        adapter.get_chat_info = AsyncMock(return_value={"chat_id": "oc_group", "name": "Platform Team", "type": "group"})
+        adapter._resolve_sender_profile = AsyncMock(
+            return_value={"user_id": "u_alice", "user_name": "Alice", "user_id_alt": "on_alice"}
+        )
+        adapter._fetch_message_text = AsyncMock(return_value="topic root context")
+        adapter._dispatch_inbound_event = AsyncMock()
+
+        message = SimpleNamespace(
+            message_id="om_topic_reply",
+            chat_id="oc_group",
+            chat_type="group",
+            message_type="text",
+            content=json.dumps({"text": "topic reply"}),
+            thread_id=None,
+            root_id="omt_topic",
+            parent_id=None,
+            upper_message_id=None,
+        )
+        sender_id = SimpleNamespace(open_id="ou_alice", user_id="u_alice", union_id="on_alice")
+        data = SimpleNamespace(event=SimpleNamespace(message=message))
+
+        raw_key = adapter._raw_text_batch_key(message, sender_id, "group")
+        asyncio.run(
+            adapter._process_inbound_message(
+                data=data,
+                message=message,
+                sender_id=sender_id,
+                chat_type="group",
+                message_id="om_topic_reply",
+            )
+        )
+
+        event = adapter._dispatch_inbound_event.await_args.args[0]
+        self.assertEqual(event.source.thread_id, "omt_topic")
+        self.assertEqual(event.reply_to_message_id, "omt_topic")
+        self.assertEqual(event.reply_to_text, "topic root context")
+        self.assertEqual(
+            raw_key,
+            build_session_key(
+                event.source,
+                group_sessions_per_user=adapter.config.extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=adapter.config.extra.get("thread_sessions_per_user", False),
+            ),
+        )
+
+
 class TestFeishuAdapterMessaging(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
@@ -851,10 +1067,10 @@ class TestAdapterBehavior(unittest.TestCase):
             run_threadsafe.assert_not_called()
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_user_reaction_with_managed_emoji_is_still_routed(self):
-        # Operator-origin filter is enough to prevent feedback loops; we must
-        # not additionally swallow user-origin reactions just because their
-        # emoji happens to collide with a lifecycle emoji.
+    def test_user_reaction_with_managed_emoji_is_accepted_for_async_handling(self):
+        # Bot/app-origin reactions are dropped before scheduling to avoid
+        # feedback loops; user-origin reactions are handled asynchronously so
+        # tracked Hermes-message reactions can enter the agent for judgment.
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -925,7 +1141,7 @@ class TestAdapterBehavior(unittest.TestCase):
 
         adapter._handle_message_with_guards.assert_not_awaited()
 
-    def _build_reaction_adapter(self, *, msg_sender_id: str):
+    def _build_reaction_adapter(self, *, msg_sender_id: str, thread_id=None, root_id=None):
         """Build a FeishuAdapter wired up to return a single GET-message result."""
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
@@ -940,6 +1156,8 @@ class TestAdapterBehavior(unittest.TestCase):
             sender=SimpleNamespace(sender_type="app", id=msg_sender_id, id_type="app_id"),
             chat_id="oc_chat",
             chat_type="group",
+            thread_id=thread_id,
+            root_id=root_id,
         )
         response = SimpleNamespace(success=lambda: True, data=SimpleNamespace(items=[msg]))
         adapter._client = SimpleNamespace(
@@ -973,8 +1191,14 @@ class TestAdapterBehavior(unittest.TestCase):
         adapter._handle_message_with_guards.assert_not_awaited()
 
     @patch.dict(os.environ, {}, clear=True)
-    def test_reaction_on_our_own_bot_message_is_routed(self):
-        adapter = self._build_reaction_adapter(msg_sender_id="cli_self_app")
+    def test_reaction_on_our_own_bot_message_routes_synthetic_event(self):
+        from gateway.platforms.base import NO_REPLY_SENTINEL
+
+        adapter = self._build_reaction_adapter(
+            msg_sender_id="cli_self_app",
+            thread_id="omt_thread",
+            root_id="omt_root",
+        )
 
         event = SimpleNamespace(
             message_id="om_reaction_msg",
@@ -986,6 +1210,19 @@ class TestAdapterBehavior(unittest.TestCase):
             adapter._handle_reaction_event("im.message.reaction.created_v1", data)
         )
         adapter._handle_message_with_guards.assert_awaited_once()
+        routed = adapter._handle_message_with_guards.await_args.args[0]
+        self.assertIn("Feishu quick reaction", routed.text)
+        self.assertIn("Action: added", routed.text)
+        self.assertIn("Emoji type: THUMBSUP", routed.text)
+        self.assertIn("Do not reply by default", routed.text)
+        self.assertIn(NO_REPLY_SENTINEL, routed.text)
+        self.assertEqual(routed.metadata["feishu_event_kind"], "reaction")
+        self.assertEqual(routed.metadata["no_reply_sentinel"], NO_REPLY_SENTINEL)
+        self.assertEqual(routed.metadata["feishu_reaction_action"], "added")
+        self.assertEqual(routed.metadata["feishu_reaction_emoji_type"], "THUMBSUP")
+        self.assertEqual(routed.source.thread_id, "omt_thread")
+        adapter._resolve_sender_profile.assert_awaited_once()
+        adapter.get_chat_info.assert_awaited_once()
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
     def test_group_message_requires_mentions_even_when_policy_open(self):
@@ -6087,6 +6324,65 @@ class TestBotNameResolution(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertNotIn("ou_peer", adapter._sender_name_cache)
+
+
+class TestProcessingReactionSyntheticEvents(unittest.TestCase):
+    @staticmethod
+    def _run(coro):
+        return asyncio.run(coro)
+
+    def _build_adapter(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._add_reaction = AsyncMock(return_value="r_typing")
+        adapter._remove_reaction = AsyncMock(return_value=True)
+        return adapter
+
+    @staticmethod
+    def _event(message_id: str = "om_msg", metadata=None):
+        from gateway.platforms.base import MessageEvent
+
+        return MessageEvent(
+            text="hello",
+            message_id=message_id,
+            metadata=metadata or {},
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_synthetic_reaction_event_skips_processing_reactions_for_fake_id(self):
+        from gateway.platforms.base import NO_REPLY_SENTINEL
+
+        adapter = self._build_adapter()
+        fake_message_id = "5d2d1d83-b1d5-4075-91ee-8b9b0b117dfb"
+        event = self._event(
+            fake_message_id,
+            metadata={
+                "feishu_event_kind": "reaction",
+                "no_reply_sentinel": NO_REPLY_SENTINEL,
+                "feishu_reaction_message_id": "om_real_bot_message",
+            },
+        )
+
+        self._run(adapter.on_processing_start(event))
+        self._run(adapter.on_processing_complete(event, ProcessingOutcome.FAILURE))
+
+        adapter._add_reaction.assert_not_awaited()
+        adapter._remove_reaction.assert_not_awaited()
+        self.assertNotIn(fake_message_id, adapter._pending_processing_reactions)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_normal_message_still_uses_processing_reactions(self):
+        adapter = self._build_adapter()
+        event = self._event("om_real_message")
+
+        self._run(adapter.on_processing_start(event))
+        self._run(adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS))
+
+        adapter._add_reaction.assert_awaited_once_with("om_real_message", "Typing")
+        adapter._remove_reaction.assert_awaited_once_with("om_real_message", "r_typing")
+        self.assertNotIn("om_real_message", adapter._pending_processing_reactions)
 
 
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")

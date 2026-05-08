@@ -525,6 +525,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    NO_REPLY_SENTINEL,
     merge_pending_message_event,
 )
 from gateway.restart import (
@@ -549,6 +550,37 @@ logger = logging.getLogger(__name__)
 # session from bypassing the "already running" guard during the async gap
 # between the guard check and actual agent creation.
 _AGENT_PENDING_SENTINEL = object()
+
+
+def _is_no_reply_sentinel_response(event: MessageEvent, response: str) -> bool:
+    """Return True when a scoped synthetic event intentionally suppresses delivery."""
+    metadata = getattr(event, "metadata", None) or {}
+    return (
+        isinstance(metadata, dict)
+        and metadata.get("no_reply_sentinel") == NO_REPLY_SENTINEL
+        and metadata.get("feishu_event_kind") == "reaction"
+        and response.strip() == NO_REPLY_SENTINEL
+    )
+
+
+def _is_no_reply_sentinel_message(message: dict) -> bool:
+    """Return True for the assistant sentinel turn that should not pollute transcripts."""
+    return (
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and str(message.get("content") or "").strip() == NO_REPLY_SENTINEL
+        and not message.get("tool_calls")
+    )
+
+
+def _filter_no_reply_sentinel_messages(messages: list[dict]) -> list[dict]:
+    return [msg for msg in messages if not _is_no_reply_sentinel_message(msg)]
+
+
+def _drop_trailing_no_reply_sentinel_message(messages: list[dict]) -> list[dict]:
+    if messages and _is_no_reply_sentinel_message(messages[-1]):
+        return messages[:-1]
+    return messages
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
@@ -6903,6 +6935,13 @@ class GatewayRunner:
 
             response = agent_result.get("final_response") or ""
 
+            suppress_no_reply_delivery = _is_no_reply_sentinel_response(event, response)
+            if suppress_no_reply_delivery:
+                logger.info(
+                    "Suppressing no-reply sentinel delivery for scoped Feishu reaction event in session %s",
+                    session_key,
+                )
+
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
             # produce visible content after exhausting all retries (nudge,
@@ -6961,6 +7000,15 @@ class GatewayRunner:
             if agent_result.get("session_id") and agent_result["session_id"] != session_entry.session_id:
                 session_entry.session_id = agent_result["session_id"]
 
+            if suppress_no_reply_delivery and self._session_db is not None:
+                try:
+                    db_messages = self._session_db.get_messages_as_conversation(session_entry.session_id)
+                    filtered_db_messages = _drop_trailing_no_reply_sentinel_message(db_messages)
+                    if len(filtered_db_messages) != len(db_messages):
+                        self._session_db.replace_messages(session_entry.session_id, filtered_db_messages)
+                except Exception as _e:
+                    logger.debug("Failed to remove no-reply sentinel from session DB: %s", _e)
+
             # Prepend reasoning/thinking if display is enabled (per-platform)
             try:
                 from gateway.display_config import resolve_display_setting as _rds
@@ -7008,7 +7056,7 @@ class GatewayRunner:
             # Emit agent:end hook
             await self.hooks.emit("agent:end", {
                 **hook_ctx,
-                "response": (response or "")[:500],
+                "response": "" if suppress_no_reply_delivery else (response or "")[:500],
             })
             
             # Opportunistic fast-path: the dispatcher loop is the real source
@@ -7157,7 +7205,7 @@ class GatewayRunner:
                         session_entry.session_id,
                         {"role": "user", "content": message_text, "timestamp": ts}
                     )
-                    if response:
+                    if response and not suppress_no_reply_delivery:
                         self.session_store.append_to_transcript(
                             session_entry.session_id,
                             {"role": "assistant", "content": response, "timestamp": ts}
@@ -7168,6 +7216,8 @@ class GatewayRunner:
                     # to prevent the duplicate-write bug (#860).  We still write
                     # to JSONL for backward compatibility and as a backup.
                     agent_persisted = self._session_db is not None
+                    if suppress_no_reply_delivery:
+                        new_messages = _filter_no_reply_sentinel_messages(new_messages)
                     for msg in new_messages:
                         # Skip system messages (they're rebuilt each run)
                         if msg.get("role") == "system":
@@ -7186,6 +7236,9 @@ class GatewayRunner:
                 session_entry.session_key,
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
+
+            if suppress_no_reply_delivery:
+                return None
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))

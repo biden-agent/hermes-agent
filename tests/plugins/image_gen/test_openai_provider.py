@@ -214,6 +214,8 @@ class TestGenerate:
         assert call_kwargs["model"] == "gpt-image-2"
         assert call_kwargs["quality"] == "medium"
         assert call_kwargs["size"] == "1536x1024"
+        assert "output_format" not in call_kwargs
+        assert "output_compression" not in call_kwargs
         # gpt-image-2 rejects response_format — we must NOT send it.
         assert "response_format" not in call_kwargs
 
@@ -248,7 +250,10 @@ class TestGenerate:
         with _patched_openai(fake_client):
             provider.generate("a cat", aspect_ratio=aspect)
 
-        assert fake_client.images.generate.call_args.kwargs["size"] == expected_size
+        call_kwargs = fake_client.images.generate.call_args.kwargs
+        assert call_kwargs["size"] == expected_size
+        assert "output_format" not in call_kwargs
+        assert "output_compression" not in call_kwargs
 
     def test_revised_prompt_passed_through(self, provider):
         fake_client = MagicMock()

@@ -866,6 +866,9 @@ class ProcessingOutcome(Enum):
     CANCELLED = "cancelled"
 
 
+NO_REPLY_SENTINEL = "<|hermes_no_reply|>"
+
+
 @dataclass
 class MessageEvent:
     """

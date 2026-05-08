@@ -141,6 +141,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    NO_REPLY_SENTINEL,
     ProcessingOutcome,
     SendResult,
     SUPPORTED_DOCUMENT_TYPES,
@@ -172,6 +173,48 @@ _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
+
+_FEISHU_MESSAGE_IDENTITY_KEYS = (
+    "message_id",
+    "chat_id",
+    "chat_type",
+    "message_type",
+    "thread_id",
+    "root_id",
+    "parent_id",
+    "upper_message_id",
+)
+
+
+def _feishu_message_identity_fields(message: Any, *, source_thread_id: Any = None) -> Dict[str, Any]:
+    """Extract Feishu identity fields from SDK objects or webhook dictionaries."""
+    fields: Dict[str, Any] = {}
+    for key in _FEISHU_MESSAGE_IDENTITY_KEYS:
+        try:
+            fields[key] = message.get(key) if isinstance(message, dict) else getattr(message, key, None)
+        except Exception:
+            fields[key] = None
+    fields["source_thread_id"] = source_thread_id
+    return fields
+
+
+def _feishu_message_field(message: Any, key: str) -> Any:
+    try:
+        return message.get(key) if isinstance(message, dict) else getattr(message, key, None)
+    except Exception:
+        return None
+
+
+def _feishu_source_thread_id(message: Any) -> Optional[str]:
+    thread_id = str(_feishu_message_field(message, "thread_id") or "").strip()
+    if thread_id:
+        return thread_id
+    root_id = str(_feishu_message_field(message, "root_id") or "").strip()
+    if root_id.startswith("omt_"):
+        return root_id
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Media type sets and upload constants
 # ---------------------------------------------------------------------------
@@ -3045,7 +3088,7 @@ class FeishuAdapter(BasePlatformAdapter):
         future.add_done_callback(self._log_background_failure)
 
     def _on_reaction_event(self, event_type: str, data: Any) -> None:
-        """Route user reactions on bot messages as synthetic text events."""
+        """Route user reactions on Hermes messages as low-noise agent context."""
         event = getattr(data, "event", None)
         message_id = str(getattr(event, "message_id", "") or "")
         operator_type = str(getattr(event, "operator_type", "") or "")
@@ -3060,8 +3103,8 @@ class FeishuAdapter(BasePlatformAdapter):
             emoji_type,
         )
         # Drop bot/app-origin reactions to break the feedback loop from our
-        # own lifecycle reactions. A human reacting with the same emoji (e.g.
-        # clicking Typing on a bot message) is still routed through.
+        # own lifecycle reactions. User reactions are validated asynchronously
+        # before being routed as synthetic events.
         loop = self._loop
         if (
             operator_type in {"bot", "app"}
@@ -3198,7 +3241,7 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("Failed to resolve gateway approval from Feishu button: %s", exc)
 
     async def _handle_reaction_event(self, event_type: str, data: Any) -> None:
-        """Fetch the reacted-to message; if Hermes sent it, emit a synthetic text event."""
+        """Fetch the reacted-to message; if Hermes sent it, route reaction context."""
         if not self._client:
             return
         event = getattr(data, "event", None)
@@ -3223,43 +3266,59 @@ class FeishuAdapter(BasePlatformAdapter):
             # peer bots and us share sender_type="app" but differ on app_id.
             sender = getattr(msg, "sender", None)
             if str(getattr(sender, "id", "") or "") != self._app_id:
-                return  # only route reactions on this bot's own messages
+                return  # only consider reactions on this bot's own messages
             chat_id = str(getattr(msg, "chat_id", "") or "")
-            chat_type_raw = str(getattr(msg, "chat_type", "p2p") or "p2p")
             if not chat_id:
                 chat_id = tracked_chat_id
             elif chat_id != tracked_chat_id:
                 return
         except Exception:
-            logger.debug("[Feishu] Failed to fetch message for reaction routing", exc_info=True)
+            logger.debug("[Feishu] Failed to fetch message for reaction handling", exc_info=True)
             return
 
-        user_id_obj = getattr(event, "user_id", None)
         reaction_type_obj = getattr(event, "reaction_type", None)
         emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
         action = "added" if "created" in event_type else "removed"
-        synthetic_text = f"reaction:{action}:{emoji_type}"
-
-        sender_profile = await self._resolve_sender_profile(user_id_obj)
+        sender_id = getattr(event, "user_id", None) or getattr(event, "operator", None)
+        if sender_id is None:
+            sender_id = SimpleNamespace(open_id=None, user_id=None, union_id=None)
+        sender_profile = await self._resolve_sender_profile(sender_id)
         chat_info = await self.get_chat_info(chat_id)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
-            chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type_raw),
+            chat_type=self._resolve_source_chat_type(
+                chat_info=chat_info,
+                event_chat_type=getattr(msg, "chat_type", "group"),
+            ),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=None,
+            thread_id=_feishu_source_thread_id(msg),
             user_id_alt=sender_profile["user_id_alt"],
+        )
+        synthetic_text = (
+            "Feishu quick reaction on a Hermes-sent message. "
+            f"Action: {action}. Emoji type: {emoji_type}. "
+            "Do not reply by default. Reply only if the surrounding context indicates "
+            "confusion, disagreement, urgency, a request for follow-up, or that a response "
+            f"would be useful. If no reply is needed, output exactly {NO_REPLY_SENTINEL}."
         )
         synthetic_event = MessageEvent(
             text=synthetic_text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=data,
-            message_id=message_id,
+            message_id=str(uuid.uuid4()),
             timestamp=datetime.now(),
+            metadata={
+                "feishu_event_kind": "reaction",
+                "no_reply_sentinel": NO_REPLY_SENTINEL,
+                "feishu_reaction_message_id": message_id,
+                "feishu_reaction_action": action,
+                "feishu_reaction_emoji_type": emoji_type,
+            },
         )
-        logger.info("[Feishu] Routing reaction %s:%s on bot message %s as synthetic event", action, emoji_type, message_id)
+        logger.info("[Feishu] Routing reaction %s:%s on bot message %s", action, emoji_type, message_id)
         await self._handle_message_with_guards(synthetic_event)
 
     def _is_card_action_duplicate(self, token: str) -> bool:
@@ -3355,6 +3414,11 @@ class FeishuAdapter(BasePlatformAdapter):
     def _reactions_enabled(self) -> bool:
         return os.getenv("FEISHU_REACTIONS", "true").strip().lower() not in ("false", "0", "no")
 
+    @staticmethod
+    def _should_skip_processing_reactions(event: MessageEvent) -> bool:
+        metadata = getattr(event, "metadata", None)
+        return isinstance(metadata, dict) and metadata.get("feishu_event_kind") == "reaction"
+
     async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
         """Return the reaction_id on success, else None. The id is needed later for deletion."""
         if not self._client or not message_id or not emoji_type:
@@ -3438,6 +3502,8 @@ class FeishuAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         if not self._reactions_enabled():
             return
+        if self._should_skip_processing_reactions(event):
+            return
         message_id = event.message_id
         if not message_id or message_id in self._pending_processing_reactions:
             return
@@ -3449,6 +3515,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
         if not self._reactions_enabled():
+            return
+        if self._should_skip_processing_reactions(event):
             return
         message_id = event.message_id
         if not message_id:
@@ -3546,7 +3614,7 @@ class FeishuAdapter(BasePlatformAdapter):
             if history_context:
                 text = f"{history_context}\n\n{text}" if text else history_context
 
-        thread_id = getattr(message, "thread_id", None) or getattr(message, "root_id", None) or None
+        thread_id = _feishu_source_thread_id(message)
         reply_to_message_id = (
             getattr(message, "parent_id", None)
             or getattr(message, "upper_message_id", None)
@@ -3585,6 +3653,11 @@ class FeishuAdapter(BasePlatformAdapter):
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
+        )
+        identity_fields = _feishu_message_identity_fields(message, source_thread_id=source.thread_id)
+        logger.info(
+            "[Feishu] Feishu inbound message identity: %s",
+            " ".join(f"{key}={value}" for key, value in identity_fields.items()),
         )
         normalized = MessageEvent(
             text=text,
@@ -3928,7 +4001,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_name=chat_id,
             chat_type=source_chat_type,
             user_id=getattr(sender_id, "user_id", None) or getattr(sender_id, "open_id", None) or None,
-            thread_id=getattr(message, "thread_id", None) or None,
+            thread_id=_feishu_source_thread_id(message),
             user_id_alt=getattr(sender_id, "union_id", None) or None,
         )
         return build_session_key(
