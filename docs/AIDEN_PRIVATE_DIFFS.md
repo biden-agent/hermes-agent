@@ -4,6 +4,7 @@
 > 仓库：`/Users/dev/.hermes/hermes-agent`  
 > 本地私有分支：`main` / `origin/main` (`git@github.com:aiden-lightning/hermes-agent.git`)  
 > 官方上游：`upstream/main` (`https://github.com/NousResearch/hermes-agent.git`)
+> 最后同步：2026-05-08 — `git merge upstream/main` 完成，222 commits merged。
 
 本文记录 `biden-agent` 与 `aiden-lightning` 两个 Git 作者在私有分支上相对官方代码保留的主要改动，用于后续同步上游、排查行为差异、以及判断哪些补丁需要继续维护或尝试 upstream。
 
@@ -11,8 +12,8 @@
 
 基于 `git fetch --all --prune` 后的结果：
 
-- `main` 相对 `upstream/main`：ahead **50** commits，behind **219** commits。
-- `main` 与 `origin/main` 同步，工作区干净。
+- `main` 相对 `upstream/main`（同步后）：ahead **50+** 私有 commits（含 merge commit），behind **0**（已合并所有上游改动）。
+- 工作区已暂存所有冲突解决，等待提交。
 - 私有 ahead commits 作者分布：
   - `Lightning@Aiden <aiden-lightning@users.noreply.github.com>`：33 个 commit
   - `Biden@Aiden <biden-agent@users.noreply.github.com>`：17 个 commit
@@ -363,9 +364,10 @@ Merge commits：
    - `.gitmodules` 与 `moss_tts_nano_repo` 需要在 clone/update 时保持可用。
    - 相关测试应确保无模型权重环境下仍可 mock 通过。
 
-5. **当前 branch behind upstream/main 219 commits**
-   - 官方代码已经继续前进，文件级 diff 包含很多“上游新增而私有分支未同步”的差异。
-   - 真正私有功能应优先以 commit 主题和局部 diff 审核，而不是直接把 `git diff upstream/main..main` 全量视为私有 patch。
+5. **当前 branch 已同步 upstream/main（2026-05-08）**
+   - 已合并 222 个上游 commits，behind 回归 0。
+   - 冲突解决位于 `gateway/run.py`、`tools/browser_tool.py`、`tests/tools/test_browser_ssrf_local.py`。
+   - 详细解决策略见下方 §6。
 
 ## 5. 建议的后续维护方式
 
@@ -402,3 +404,43 @@ Merge commits：
 
 4. **保留此文档作为差异索引**
    - 后续新增私有 commit 时，在本文追加主题、commit 和测试入口。
+
+## 6. 本次上游同步冲突解决记录（2026-05-08）
+
+合并 222 个 upstream commits，3 个文件存在冲突。以下为每处冲突的解决策略：
+
+### 6.1 `gateway/run.py` — 5 处冲突
+
+1. **方法区冲突（Aiden 进程 watcher vs 上游 goal 管理）**
+   - 双方均为新增独立方法，无逻辑重叠。保留双方代码：`_track_background_task`、`_start_process_watcher_task`、`_drain_process_watcher_registrations`、`_process_watcher_dispatcher`（Aiden）+ `_is_goal_continuation_event`、`_clear_goal_pending_continuations`、`_goal_still_active_for_session`（upstream）。
+
+2. **重启启动路径**
+   - 上游新增 `_schedule_resume_pending_sessions()` 调度中断会话自动恢复，原始循环恢复 process watcher。采用上游框架，但使用 Aiden 的 `_drain_process_watcher_registrations(recovered=True)` 替代 raw 循环，保留去重和日志增强。
+
+3. **turn 完成后清除 resume_pending**
+   - 上游新增 `_should_clear_resume_pending_after_turn()` 辅助函数，逻辑更严谨（检查 interrupted、failed、partial、completed 状态）。采用上游版本。
+
+4. **error/success 路径返回 dict**
+   - 上游新增 `partial`、`completed`、`error` 字段，丰富结果元数据。采用上游版本以兼容调用方。
+
+### 6.2 `tools/browser_tool.py` — 2 处冲突
+
+1. **url_safety import fallback**
+   - `_is_always_blocked_url` fallback lambda：私有用 `return False`，上游用 `return True`。采用上游 `return True`（即便安全模块不可用，也阻止 metadata endpoint）。
+
+2. **SSRF 检查统一为 `not _is_local_backend()` 风格**
+   - 双方在 pre-nav IMDS、general SSRF、post-redirect 三处使用不同的变量判断（私有用 `cloud_ssrf_applies = not _is_local_backend()`，上游直接写 `not _is_local_backend()`）。
+   - 冲突解决时两套代码共存，导致 pre-nav IMDS 块重复（私有版本影子了上游版本，使上游版本成为死代码）。
+   - 最终清理：删除私有 `cloud_ssrf_applies` 变量，所有三处检查统一使用上游 `not _is_local_backend()` 风格。pre-nav IMDS 保留上游详细注释 + #16234 说明 + 特定错误消息，语义更明确。
+
+### 6.3 `tests/tools/test_browser_ssrf_local.py` — 1 处冲突 + 后续修复
+
+- 上游新增 `test_cloud_blocks_redirect_to_imds_even_via_sidecar` 测试 + `TestAllowPrivateUrlsConfig` 类。采用上游完整新测试，验证 IMDS 阻断和 allow_private_urls 配置行为。
+- 冲突解决后仍有 8 项测试因以下原因失败：
+
+  a. **`_allow_private_urls` 模块级函数丢失**：私有分支的 `browser_tool._allow_private_urls()`（读取 `security.allow_private_urls` / 旧 `browser.allow_private_urls`）在冲突清理时被移除，但测试仍使用 monkeypatch 设置该属性。已于 2026-05-08 恢复，作为带独立缓存的模块级函数，使用 `utils.is_truthy_value` 处理配置字符串。
+
+  b. **错误消息变更**：上游 IMDS 阻断使用精确消息 `"URL targets a cloud metadata endpoint"` / `"redirect landed on a cloud metadata endpoint"`。私有分支测试中两处的旧断言已更新：
+
+  - `TestPreNavigationSsrf.test_cloud_auto_local_blocks_always_blocked_url`：`"private or internal address"` → `"cloud metadata endpoint"`
+  - `TestPostRedirectSsrf.test_cloud_auto_local_blocks_redirect_to_always_blocked_url`：`"redirect landed on a private/internal address"` → `"cloud metadata endpoint"`
