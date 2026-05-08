@@ -76,7 +76,7 @@ delegate_task(
     3. Write minimal implementation
     4. Run: pytest tests/models/test_user.py -v (verify PASS)
     5. Run: pytest tests/ -q (verify no regressions)
-    6. Commit: git add -A && git commit -m "feat: add User model with password hashing"
+    6. Do NOT commit unless the user explicitly requested commit in the current session. If commit was explicitly requested: git add -A && git commit -m "feat: add User model with password hashing"
 
     PROJECT CONTEXT:
     - Python 3.11, Flask app in src/app.py
@@ -182,7 +182,7 @@ pytest tests/ -q
 # Review all changes
 git diff --stat
 
-# Final commit if needed
+# Commit only if the user explicitly requested commit in the current session
 git add -A && git commit -m "feat: complete [feature name] implementation"
 ```
 
@@ -214,6 +214,7 @@ git add -A && git commit -m "feat: complete [feature name] implementation"
 - Let implementer self-review replace actual review (both are needed)
 - **Start code quality review before spec compliance is PASS** (wrong order)
 - Move to next task while either review has open issues
+- Commit or push from a subagent/controller unless the user explicitly requested commit/push in the current session
 
 ## Handling Issues
 
@@ -265,7 +266,7 @@ Implementer subagents should follow TDD:
 1. Write failing test first
 2. Implement minimal code
 3. Verify test passes
-4. Commit
+4. Do not commit unless the user explicitly requested commit in the current session
 
 Include TDD instructions in every implementer context.
 
@@ -291,7 +292,7 @@ If a subagent encounters bugs during implementation:
 [Dispatch implementer subagent]
   Implementer: "Should email be unique?"
   You: "Yes, email must be unique"
-  Implementer: Implemented, 3/3 tests passing, committed.
+  Implementer: Implemented, 3/3 tests passing. No commit made because commit was not explicitly requested.
 
 [Dispatch spec reviewer]
   Spec reviewer: ✅ PASS — all requirements met
