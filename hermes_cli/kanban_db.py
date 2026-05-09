@@ -964,7 +964,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     Called by ``init_db`` so opening an old DB is always safe.
     """
-    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    cols = {row["name"].lower() for row in conn.execute("PRAGMA table_info(tasks)")}
     if "tenant" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN tenant TEXT")
     if "result" not in cols:
@@ -992,6 +992,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # not refreshed between ALTER TABLE calls.  Every guard below checks
     # the *original* snapshot; this is intentional and safe as long as
     # no step depends on a column added by a previous step in the same call.
+    # SQLite identifiers are case-insensitive, so normalize PRAGMA names too.
     if "consecutive_failures" not in cols:
         conn.execute(
             "ALTER TABLE tasks ADD COLUMN consecutive_failures "
@@ -1035,7 +1036,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     # task_events gained a run_id column; back-fill it as NULL for
     # historical events (they predate runs and can't be attributed).
-    ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
+    ev_cols = {row["name"].lower() for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         conn.execute("ALTER TABLE task_events ADD COLUMN run_id INTEGER")
         conn.execute(

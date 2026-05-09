@@ -2840,6 +2840,51 @@ def test_legacy_db_without_skills_column_migrates(tmp_path):
     conn.close()
 
 
+def test_legacy_max_retries_column_case_migrates_without_duplicate(tmp_path):
+    """SQLite treats column names case-insensitively during ALTER TABLE.
+
+    A legacy/manual DB can already contain MAX_RETRIES with different casing;
+    the migration must recognize it instead of attempting to add max_retries
+    again and raising ``duplicate column name: max_retries``.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "legacy-max-retries-case.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("""
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            MAX_RETRIES INTEGER
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE task_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload TEXT,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute(
+        "INSERT INTO tasks (id, title, status, created_at, MAX_RETRIES) "
+        "VALUES ('legacy', 'old task', 'ready', 1, 2)"
+    )
+    conn.commit()
+
+    kb._migrate_add_optional_columns(conn)
+
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(tasks)")]
+    assert sum(1 for col in cols if col.lower() == "max_retries") == 1
+    row = conn.execute("SELECT * FROM tasks WHERE id = 'legacy'").fetchone()
+    assert row["max_retries"] == 2
+    conn.close()
+
+
 def test_legacy_spawn_failure_columns_are_copied_not_renamed(tmp_path):
     """Legacy failure counters survive migration without fragile column renames."""
     import sqlite3
