@@ -6061,7 +6061,33 @@ class TestGroupMentionAtAll(unittest.TestCase):
     """Tests for @_all (Feishu @everyone) group mention routing."""
 
     @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
-    def test_at_all_in_content_accepts_without_explicit_bot_mention(self):
+    def test_at_all_in_content_ignored_by_default(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            content='{"text":"@_all 请注意"}',
+            mentions=[],
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertFalse(_admits_group(adapter, message, sender_id, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_at_all_config_false_restores_mention_gate_behavior(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"ignore_at_all": False}))
+        message = SimpleNamespace(
+            content='{"text":"@_all 请注意"}',
+            mentions=[],
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open", "FEISHU_IGNORE_AT_ALL": "false"}, clear=True)
+    def test_at_all_env_false_restores_mention_gate_behavior(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
@@ -6073,13 +6099,32 @@ class TestGroupMentionAtAll(unittest.TestCase):
         sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
         self.assertTrue(_admits_group(adapter, message, sender_id, ""))
 
-    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
-    def test_at_all_still_requires_policy_gate(self):
-        """@_all bypasses mention gating but NOT the allowlist policy."""
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open", "FEISHU_BOT_OPEN_ID": "ou_bot"}, clear=True)
+    def test_at_all_does_not_mask_explicit_bot_mention(self):
         from gateway.config import PlatformConfig
         from gateway.platforms.feishu import FeishuAdapter
 
         adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(
+            content='{"text":"@_all @_user_1 请看"}',
+            mentions=[
+                SimpleNamespace(
+                    key="@_user_1",
+                    name="Hermes",
+                    id=SimpleNamespace(open_id="ou_bot", user_id=""),
+                )
+            ],
+        )
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(_admits_group(adapter, message, sender_id, ""))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed"}, clear=True)
+    def test_at_all_still_requires_policy_gate(self):
+        """@_all can bypass mention gating when enabled, but not allowlists."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig(extra={"ignore_at_all": False}))
         message = SimpleNamespace(content='{"text":"@_all attention"}', mentions=[])
         # Non-allowlisted user — should be blocked even with @_all.
         blocked_sender = SimpleNamespace(open_id="ou_blocked", user_id=None)

@@ -20,12 +20,18 @@ tests/gateway/test_feishu_approval_buttons.py ← 审批按钮测试
 ### 2. `FEISHU_GROUP_POLICY=open`
 - 全组织可对话，无需白名单
 
+### 3. `FEISHU_IGNORE_AT_ALL` / `ignore_at_all` — 忽略 @everyone
+- 默认忽略 Feishu/Lark 的 `@_all`（@everyone），避免群公告触发机器人。
+- 显式 @ 机器人仍会触发。
+- 如需恢复旧行为，可设置 `FEISHU_IGNORE_AT_ALL=false` 或 `platforms.feishu.extra.ignore_at_all: false`。
+
 ## 部署
 
 ```bash
 # 环境变量（加到 ~/.hermes/.env）
 FEISHU_GROUP_POLICY=open
 FEISHU_REQUIRE_MENTION=false
+FEISHU_IGNORE_AT_ALL=true
 
 # 重启
 hermes gateway restart

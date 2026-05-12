@@ -471,6 +471,7 @@ class FeishuAdapterSettings:
     ws_ping_timeout: Optional[int] = None
     admins: frozenset[str] = frozenset()
     require_mention: bool = True
+    ignore_at_all: bool = True
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
@@ -1737,6 +1738,11 @@ class FeishuAdapter(BasePlatformAdapter):
         else:
             require_mention = os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower() != "false"
 
+        configured_ignore_at_all = _coerce_optional_bool(extra.get("ignore_at_all"))
+        if configured_ignore_at_all is None:
+            configured_ignore_at_all = _coerce_optional_bool(os.getenv("FEISHU_IGNORE_AT_ALL"))
+        ignore_at_all = True if configured_ignore_at_all is None else configured_ignore_at_all
+
         # Default group policy (for groups not in group_rules)
         default_group_policy = str(extra.get("default_group_policy", "")).strip().lower()
         group_history_inject_count = _coerce_required_int(
@@ -1816,6 +1822,7 @@ class FeishuAdapter(BasePlatformAdapter):
             ws_ping_timeout=_coerce_int(extra.get("ws_ping_timeout"), default=None, min_value=1),
             admins=admins,
             require_mention=require_mention,
+            ignore_at_all=ignore_at_all,
             default_group_policy=default_group_policy,
             group_rules=group_rules,
             allow_bots=allow_bots,
@@ -1887,6 +1894,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._allowed_group_users = set(settings.allowed_group_users)
         self._admins = set(settings.admins)
         self._require_mention = settings.require_mention
+        self._ignore_at_all = settings.ignore_at_all
         self._default_group_policy = settings.default_group_policy or settings.group_policy
         self._group_rules = settings.group_rules
         self._bot_open_id = settings.bot_open_id
@@ -1908,6 +1916,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._ws_ping_timeout = settings.ws_ping_timeout
         self._allow_bots = settings.allow_bots
         self._require_mention = settings.require_mention
+        self._ignore_at_all = settings.ignore_at_all
         self._outbound_mention_lookup_enabled = settings.outbound_mention_lookup_enabled
         self._outbound_mention_lookup_chat_members_enabled = settings.outbound_mention_lookup_chat_members_enabled
         self._outbound_mention_cache_ttl_seconds = settings.outbound_mention_cache_ttl_seconds
@@ -5049,7 +5058,7 @@ class FeishuAdapter(BasePlatformAdapter):
     def _mentions_self(self, message: Any) -> bool:
         # @_all is Feishu's @everyone placeholder.
         raw_content = getattr(message, "content", "") or ""
-        if "@_all" in raw_content:
+        if "@_all" in raw_content and not self._ignore_at_all:
             return True
         mentions = getattr(message, "mentions", None) or []
         if mentions and self._message_mentions_bot(mentions):

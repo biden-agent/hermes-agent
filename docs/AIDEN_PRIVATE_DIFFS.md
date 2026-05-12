@@ -42,6 +42,7 @@
 1. **群聊触发策略与开放策略**
    - 支持 `FEISHU_REQUIRE_MENTION` / `require_mention`，允许配置群聊是否必须 @ 机器人才触发。
    - 支持开放群策略（历史记录中称为 `FEISHU_GROUP_POLICY=open`）。
+   - 默认忽略 Feishu/Lark `@_all`（@everyone），避免群公告触发机器人；可通过 `FEISHU_IGNORE_AT_ALL=false` 或 `platforms.feishu.extra.ignore_at_all: false` 恢复旧行为。
    - 相关 commit：`c83d9a64b feat(feishu): configurable requireMention, admin-only approval, open group policy`。
 
 2. **审批卡片与安全交互**
