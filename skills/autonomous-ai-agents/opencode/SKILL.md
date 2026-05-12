@@ -4,6 +4,7 @@ description: Delegate coding tasks to OpenCode CLI agent for feature implementat
 version: 1.2.0
 author: Hermes Agent
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [Coding-Agent, OpenCode, Autonomous, Refactoring, Code-Review]

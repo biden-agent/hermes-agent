@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import getpass
 import os
+import shlex
 import sys
 from pathlib import Path
 
@@ -55,6 +56,33 @@ def _prompt(label: str, default: str | None = None, secret: bool = False) -> str
 # Provider discovery
 # ---------------------------------------------------------------------------
 
+_UNSAFE_CHECK_CHARS = set(";&|<>`\n\r")
+_SHELL_EXECUTABLES = {"sh", "bash", "zsh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"}
+
+
+def _safe_dependency_check_argv(check_cmd: object) -> list[str] | None:
+    """Return a safe argv for plugin dependency checks, or None if unsafe."""
+    if isinstance(check_cmd, str):
+        if any(char in check_cmd for char in _UNSAFE_CHECK_CHARS) or "$" in check_cmd:
+            return None
+        try:
+            argv = shlex.split(check_cmd)
+        except ValueError:
+            return None
+    elif isinstance(check_cmd, list) and all(isinstance(part, str) for part in check_cmd):
+        argv = check_cmd
+    else:
+        return None
+
+    if not argv:
+        return None
+
+    executable = Path(argv[0]).name.lower()
+    if executable in _SHELL_EXECUTABLES:
+        return None
+    return argv
+
+
 def _install_dependencies(provider_name: str) -> None:
     """Install pip dependencies declared in plugin.yaml."""
     import subprocess
@@ -69,7 +97,7 @@ def _install_dependencies(provider_name: str) -> None:
 
     try:
         import yaml
-        with open(yaml_path) as f:
+        with open(yaml_path, encoding="utf-8") as f:
             meta = yaml.safe_load(f) or {}
     except Exception:
         return
@@ -132,9 +160,15 @@ def _install_dependencies(provider_name: str) -> None:
         check_cmd = dep.get("check", "")
         install_cmd = dep.get("install", "")
         if check_cmd:
+            check_argv = _safe_dependency_check_argv(check_cmd)
+            if check_argv is None:
+                print(f"\n  ⚠ Unsafe dependency check for '{dep_name}' skipped.")
+                if install_cmd:
+                    print(f"    Install manually: {install_cmd}")
+                continue
             try:
                 subprocess.run(
-                    check_cmd, shell=True, capture_output=True, timeout=5
+                    check_argv, shell=False, capture_output=True, timeout=5, check=True
                 )
             except Exception:
                 if install_cmd:
@@ -377,7 +411,7 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
         if key not in updated_keys:
             new_lines.append(f"{key}={val}")
 
-    env_path.write_text("\n".join(new_lines) + "\n")
+    env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
