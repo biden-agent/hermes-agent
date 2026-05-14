@@ -4,7 +4,7 @@
 > 仓库：`/Users/dev/.hermes/hermes-agent`  
 > 本地私有分支：`main` / `origin/main` (`git@github.com:aiden-lightning/hermes-agent.git`)  
 > 官方上游：`upstream/main` (`https://github.com/NousResearch/hermes-agent.git`)
-> 最后同步：2026-05-08 — `git merge upstream/main` 完成，222 commits merged。
+> 最后同步：2026-05-14 — `git merge upstream/main` 完成，172 commits merged。
 
 本文记录 `biden-agent` 与 `aiden-lightning` 两个 Git 作者在私有分支上相对官方代码保留的主要改动，用于后续同步上游、排查行为差异、以及判断哪些补丁需要继续维护或尝试 upstream。
 
@@ -365,10 +365,11 @@ Merge commits：
    - `.gitmodules` 与 `moss_tts_nano_repo` 需要在 clone/update 时保持可用。
    - 相关测试应确保无模型权重环境下仍可 mock 通过。
 
-5. **当前 branch 已同步 upstream/main（2026-05-08）**
-   - 已合并 222 个上游 commits，behind 回归 0。
-   - 冲突解决位于 `gateway/run.py`、`tools/browser_tool.py`、`tests/tools/test_browser_ssrf_local.py`。
-   - 详细解决策略见下方 §6。
+5. **最近一次 upstream 同步（2026-05-14）**
+   - 合并 172 个上游 commits。
+   - 冲突解决位于 `gateway/run.py`、`hermes_cli/memory_setup.py`。
+   - `gateway/run.py` 同时保留 Aiden per-user/platform command permission enforcement 与上游 free-form `clarify` reply interception；先执行权限拒绝检查，再让非 slash 文本回复解析为 pending clarify 的答案。
+   - `hermes_cli/memory_setup.py` 保留 Aiden `_safe_dependency_check_argv(...)` + `shell=False` 的安全依赖检查路径，吸收上游检查行为并去除重复 `shlex` import。
 
 ## 5. 建议的后续维护方式
 
@@ -406,7 +407,30 @@ Merge commits：
 4. **保留此文档作为差异索引**
    - 后续新增私有 commit 时，在本文追加主题、commit 和测试入口。
 
-## 6. 本次上游同步冲突解决记录（2026-05-08）
+## 6. 历次上游同步冲突解决记录
+
+### 6.1 本次上游同步冲突解决记录（2026-05-14）
+
+合并 172 个 upstream commits，2 个文件存在冲突。以下为每处冲突的解决策略：
+
+#### 6.1.1 `gateway/run.py`
+
+- 冲突点在私有/Aiden command permission enforcement 与上游 free-form `clarify` text reply interception 的相邻插入位置。
+- 解决策略：保留两者，并维持权限拒绝检查在前；若命令/工具权限拒绝则直接返回拒绝信息，否则检查 pending clarify。
+- clarify 拦截只消费非空且非 slash command 的文本回复，调用 `tools.clarify_gateway.resolve_gateway_clarify(...)` 后返回空字符串，避免将同一条回复再次作为新 agent turn 发送。
+- 同文件还带入上游本次新增 gateway 行为（例如 security advisory startup logging、`/codex-runtime`、`/subgoal`、hook `chat_id`、queued follow-up history offset preservation 等），未删除既有 Aiden Feishu/gateway 私有逻辑。
+
+#### 6.1.2 `hermes_cli/memory_setup.py`
+
+- 冲突点在依赖检查命令解析：上游直接 `shlex.split(...)`，私有分支已有 `_safe_dependency_check_argv(...)` + `shell=False` 安全包装。
+- 解决策略：保留 `_safe_dependency_check_argv(...)` 路径，吸收上游检查行为，并去除 merge 后重复的 `import shlex`。
+
+#### 6.1.3 本次验证
+
+- `python -m py_compile gateway/run.py hermes_cli/memory_setup.py`
+- `scripts/run_tests.sh tests/gateway/test_feishu_command_permissions.py tests/tools/test_clarify_gateway.py tests/hermes_cli/test_setup.py -q`
+
+### 6.2 上游同步冲突解决记录（2026-05-08）
 
 合并 222 个 upstream commits，3 个文件存在冲突。以下为每处冲突的解决策略：
 
