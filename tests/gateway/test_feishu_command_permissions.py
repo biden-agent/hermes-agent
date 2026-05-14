@@ -202,6 +202,59 @@ def test_feishu_member_can_opt_in_to_plain_text():
     assert result is None
 
 
+@pytest.mark.asyncio
+async def test_feishu_member_plain_text_resolves_pending_clarify_when_plain_text_disallowed():
+    from tools import clarify_gateway as cm
+
+    runner = _make_runner(
+        admins=["ou_admin"],
+        command_permissions={"allowed_commands": ["status"]},
+    )
+    source = _make_source()
+    cm.clear_session(build_session_key(source))
+    cm.register(
+        clarify_id="clarify-feishu-perms",
+        session_key=build_session_key(source),
+        question="What should I do next?",
+        choices=None,
+    )
+
+    try:
+        result = await runner._handle_message(_make_event("use option B", source=source))
+
+        assert result == ""
+        assert cm.wait_for_response("clarify-feishu-perms", timeout=0) == "use option B"
+    finally:
+        cm.clear_session(build_session_key(source))
+
+
+@pytest.mark.asyncio
+async def test_feishu_member_slash_command_does_not_resolve_pending_clarify():
+    from tools import clarify_gateway as cm
+
+    runner = _make_runner(
+        admins=["ou_admin"],
+        command_permissions={"allowed_commands": ["status"]},
+    )
+    runner._handle_status_command = AsyncMock(return_value="status: ok")
+    source = _make_source()
+    cm.clear_session(build_session_key(source))
+    cm.register(
+        clarify_id="clarify-feishu-slash",
+        session_key=build_session_key(source),
+        question="What should I do next?",
+        choices=None,
+    )
+
+    try:
+        result = await runner._handle_message(_make_event("/status", source=source))
+
+        assert result == "status: ok"
+        assert cm.get_pending_for_session(build_session_key(source)) is not None
+    finally:
+        cm.clear_session(build_session_key(source))
+
+
 def test_feishu_member_tool_permissions_limit_enabled_toolsets(monkeypatch):
     import hermes_cli.tools_config as tools_config
 

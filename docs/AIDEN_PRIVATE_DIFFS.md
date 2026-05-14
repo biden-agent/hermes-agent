@@ -368,7 +368,7 @@ Merge commits：
 5. **最近一次 upstream 同步（2026-05-14）**
    - 合并 172 个上游 commits。
    - 冲突解决位于 `gateway/run.py`、`hermes_cli/memory_setup.py`。
-   - `gateway/run.py` 同时保留 Aiden per-user/platform command permission enforcement 与上游 free-form `clarify` reply interception；先执行权限拒绝检查，再让非 slash 文本回复解析为 pending clarify 的答案。
+   - `gateway/run.py` 同时保留 Aiden per-user/platform command permission enforcement 与上游 free-form `clarify` reply interception；非 slash 文本仅在同 session 存在 pending clarify 时先解析为答案，slash command 与其它普通文本仍走权限检查。
    - `hermes_cli/memory_setup.py` 保留 Aiden `_safe_dependency_check_argv(...)` + `shell=False` 的安全依赖检查路径，吸收上游检查行为并去除重复 `shlex` import。
 
 ## 5. 建议的后续维护方式
@@ -416,7 +416,7 @@ Merge commits：
 #### 6.1.1 `gateway/run.py`
 
 - 冲突点在私有/Aiden command permission enforcement 与上游 free-form `clarify` text reply interception 的相邻插入位置。
-- 解决策略：保留两者，并维持权限拒绝检查在前；若命令/工具权限拒绝则直接返回拒绝信息，否则检查 pending clarify。
+- 解决策略：保留两者，但 pending clarify 的非 slash 文本回复必须先于 free-text 权限拒绝处理，否则 `allow_plain_text=false` 会阻止用户回答 clarify；slash command 不被 clarify 消费，仍按 command permission enforcement 正常检查。
 - clarify 拦截只消费非空且非 slash command 的文本回复，调用 `tools.clarify_gateway.resolve_gateway_clarify(...)` 后返回空字符串，避免将同一条回复再次作为新 agent turn 发送。
 - 同文件还带入上游本次新增 gateway 行为（例如 security advisory startup logging、`/codex-runtime`、`/subgoal`、hook `chat_id`、queued follow-up history offset preservation 等），未删除既有 Aiden Feishu/gateway 私有逻辑。
 

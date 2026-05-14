@@ -6304,14 +6304,6 @@ class GatewayRunner:
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
 
-        permission_denial = self._check_command_permissions(
-            event,
-            raw_command=command,
-            canonical_command=canonical,
-        )
-        if permission_denial:
-            return permission_denial
-
         # Intercept messages that are responses to a pending clarify
         # request that is awaiting free-form text (either an open-ended
         # clarify with no choices, or one where the user picked the
@@ -6342,6 +6334,14 @@ class GatewayRunner:
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
                     return ""
+
+        permission_denial = self._check_command_permissions(
+            event,
+            raw_command=command,
+            canonical_command=canonical,
+        )
+        if permission_denial:
+            return permission_denial
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
